@@ -257,6 +257,9 @@ criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 [policy."embedded-tls:0.16.3"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
+[policy."embedded-websocket:0.9.5"]
+criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
+
 [policy."enumn:0.1.14"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
@@ -329,16 +332,25 @@ criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 [policy."fugit:0.3.9"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
-[policy."futures-core:0.3.32"]
+[policy."futures-channel:0.3.34"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
-[policy."futures-sink:0.3.32"]
+[policy."futures-core:0.3.34"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
-[policy."futures-task:0.3.32"]
+[policy."futures-io:0.3.34"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
-[policy."futures-util:0.3.32"]
+[policy."futures-sink:0.3.34"]
+criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
+
+[policy."futures-task:0.3.34"]
+criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
+
+[policy."futures-util:0.3.34"]
+criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
+
+[policy."futures:0.3.34"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
 [policy."gcd:2.3.0"]
@@ -401,6 +413,9 @@ criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 [policy."hmac:0.12.1"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
+[policy."httparse:1.10.1"]
+criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
+
 [policy."ident_case:1.0.1"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
@@ -441,6 +456,9 @@ criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
 [policy."manyhow:0.11.4"]
+criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
+
+[policy."max7219:0.5.0"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
 [policy."maybe-async-cfg:0.2.5"]
@@ -600,6 +618,9 @@ criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
 [policy."serde_yaml:0.9.34+deprecated"]
+criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
+
+[policy."sha1:0.10.7"]
 criteria = ["crypto-safe", "safe-to-deploy", "ub-risk-2"]
 
 [policy."sha2:0.10.9"]

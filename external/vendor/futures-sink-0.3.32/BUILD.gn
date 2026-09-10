@@ -19,6 +19,9 @@ import("//build/templates/cargo_crate.gni")
 
 cargo_crate("futures_sink") {
   epoch = "0.3"
+
+  # Disambiguate StableCrateId from futures-sink-0.3.34 (epoch collides at 0.3).
+  rustc_metadata = "futures_sink-0.3.32"
   crate_type = "rlib"
   sources = [ "//external/vendor/futures-sink-0.3.32/src/lib.rs" ]
   inputs = []
