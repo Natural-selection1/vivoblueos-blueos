@@ -30,8 +30,6 @@ cargo_crate("esp_hal") {
     "//external/vendor/embedded-hal-1.0.0:embedded_hal",
     "//external/vendor/embedded-hal-async-1.0.0:embedded_hal_async",
     "//external/vendor/enumset-1.1.13:enumset",
-    "//external/vendor/esp-config-0.7.0:esp_config",
-    "//external/vendor/esp-metadata-generated-0.4.0:esp_metadata_generated",
     "//external/vendor/esp-rom-sys-0.1.4:esp_rom_sys",
     "//external/vendor/esp-sync-0.2.1:esp_sync",
     "//external/vendor/fugit-0.3.9:fugit",

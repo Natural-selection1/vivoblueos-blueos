@@ -28,7 +28,6 @@ cargo_crate("esp_sync") {
     "//external/vendor/embassy-sync-0.6.2:embassy_sync",
     "//external/vendor/embassy-sync-0.7.2:embassy_sync",
     "//external/vendor/embassy-sync-0.8.0:embassy_sync",
-    "//external/vendor/esp-metadata-generated-0.4.0:esp_metadata_generated",
   ]
   build_deps = [
     "//external/vendor/esp-metadata-generated-0.4.0:esp_metadata_generated",
