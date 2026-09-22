@@ -1,0 +1,21 @@
+# Build artifacts
+out/
+target/
+
+# Config files
+*.config
+*.config.old
+
+# Patch files
+*.rej
+*.orig
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

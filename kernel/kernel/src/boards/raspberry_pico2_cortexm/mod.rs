@@ -1,0 +1,172 @@
+// Copyright (c) 2025 vivo Mobile Communication Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+mod block;
+
+use crate::{
+    arch::{self, irq::IrqNumber},
+    boot,
+    boot::INIT_BSS_DONE,
+    devices::{clock::systick, i2c_core::block_i2c::BlockI2c},
+    irq::IrqTrace,
+    time,
+};
+use blueos_driver::uart::arm_pl011::ArmPl011Isr;
+use blueos_hal::{clock::Clock, clock_control::ClockControl};
+use core::ptr::addr_of;
+use spin::Once;
+
+// const definitions
+pub const UART0_IRQN: IrqNumber = IrqNumber::new(33);
+
+#[link_section = ".start_block"]
+#[used]
+pub static IMAGE_DEF: block::ImageDef = block::ImageDef::secure_exe();
+
+#[repr(C)]
+struct CopyTable {
+    src: *const u32,
+    dest: *mut u32,
+    wlen: u32,
+}
+
+#[repr(C)]
+struct ZeroTable {
+    dest: *mut u32,
+    wlen: u32,
+}
+
+// Copy data from FLASH to RAM.
+#[inline(never)]
+unsafe fn copy_data() {
+    extern "C" {
+        static __zero_table_start: ZeroTable;
+        static __zero_table_end: ZeroTable;
+        static __copy_table_start: CopyTable;
+        static __copy_table_end: CopyTable;
+    }
+
+    let mut p_table = addr_of!(__copy_table_start);
+    while p_table < addr_of!(__copy_table_end) {
+        let table = &(*p_table);
+        for i in 0..table.wlen {
+            core::ptr::write(
+                table.dest.add(i as usize),
+                core::ptr::read(table.src.add(i as usize)),
+            );
+        }
+        p_table = p_table.offset(1);
+    }
+
+    let mut p_table = addr_of!(__zero_table_start);
+    while p_table < addr_of!(__zero_table_end) {
+        let table = &*p_table;
+        for i in 0..table.wlen {
+            core::ptr::write(table.dest.add(i as usize), 0);
+        }
+        p_table = p_table.offset(1);
+    }
+    INIT_BSS_DONE = true;
+}
+
+const TICKS_PS: usize = blueos_kconfig::CONFIG_TICKS_PER_SECOND as usize;
+pub type ClockImpl = systick::SysTickClock<TICKS_PS, 150_000_000usize>;
+
+pub(crate) fn init() {
+    unsafe {
+        const SCB_CPACR_PTR: *mut u32 = 0xE000_ED88 as *mut u32;
+        const SCB_CPACR_FULL_ACCESS: u32 = 0b11;
+        let mut temp = SCB_CPACR_PTR.read_volatile();
+        temp |= SCB_CPACR_FULL_ACCESS << (4 * 2);
+        temp |= 0x00F00000;
+        SCB_CPACR_PTR.write_volatile(temp);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        copy_data();
+        arch::irq::init_interrupt_registry();
+    }
+    boot::init_runtime();
+    blueos_driver::clock_control::rpi_pico::RpiPicoClockControl::init();
+
+    unsafe { boot::init_heap() };
+    arch::irq::init();
+    arch::irq::enable_irq_with_priority(UART0_IRQN, arch::irq::Priority::Normal);
+    ClockImpl::init();
+}
+
+crate::define_peripheral! {
+    (console_uart, blueos_driver::uart::arm_pl011::ArmPl011<'static>,
+     blueos_driver::uart::arm_pl011::ArmPl011::<'static>::new(
+        0x40070000 as _,
+        150_000_000,
+        Some((get_device!(subsys_reset), 26)),
+     )),
+    (subsys_reset, blueos_driver::reset::rpi_pico_reset::RpiPicoReset,
+    blueos_driver::reset::rpi_pico_reset::RpiPicoReset::new(
+        0x40020000
+    )),
+    (i2c0, blueos_driver::i2c::i2c_dw::I2cDw,
+     blueos_driver::i2c::i2c_dw::I2cDw::new(
+        0x40090000,
+        150_000_000,
+        Some((get_device!(subsys_reset), 4)),
+     )),
+
+}
+
+crate::define_pin_states!(
+    blueos_driver::pinctrl::rpi_pico::RpiPicoPinctrl,
+    (2, 11), // GPIO2 as UART0_TX
+    (3, 11), // GPIO3 as UART0_RX
+    (4, 3),  // GPIO4 as I2C0_SDA
+    (5, 3),  // GPIO5 as I2C0_SCL
+);
+
+crate::define_bus! {
+    (
+        i2c0_bus,
+        crate::devices::i2c_core::block_i2c::BlockI2c<blueos_driver::i2c::i2c_dw::I2cDw>,
+        #[cfg(bme280)]
+        (bme280, crate::drivers::sensor::bme280::Bme280Config,
+            crate::drivers::sensor::bme280::Bme280Config::new(0x76)
+        ),
+    )
+}
+
+#[blueos_macro::interrupt(no = 33)]
+static ARM_PL011_ISR: ArmPl011Isr<0x40070000, crate::drivers::serial::Serial> =
+    ArmPl011Isr::<0x40070000, _> {
+        data: &crate::drivers::serial::TTY_SERIAL,
+        tx_isr: Some(crate::drivers::serial::Serial::xmitchars),
+        rx_isr: Some(crate::drivers::serial::Serial::recvchars),
+    };
+
+pub(crate) fn init_i2c_bus() {
+    use crate::{devices::bus::Bus, drivers::InitDriver};
+    use alloc::sync::Arc;
+
+    if let Ok(block_i2c) = BlockI2c::new(get_device!(i2c0)) {
+        let i2c0_bus = Arc::new(Bus::new(block_i2c));
+        for device in crate::boards::get_bus_devices!(i2c0_bus) {
+            i2c0_bus.register_device(device).unwrap();
+        }
+        #[cfg(bme280)]
+        if let Ok(d) = i2c0_bus.probe_driver(&crate::drivers::sensor::bme280::Bme280DriverModule) {
+            if let Err(e) = d.init(&i2c0_bus) {
+                log::warn!("Failed to init Bme280 driver: {}", e);
+            }
+        } else {
+            log::warn!("Failed to probe Bme280 driver");
+        }
+    }
+}

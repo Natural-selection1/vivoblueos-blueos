@@ -1,0 +1,876 @@
+// Copyright (c) 2026 vivo Mobile Communication Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Core network types extracted from mod.rs for the layered architecture.
+//!
+//! This module holds the fundamental POSIX socket types (domain, type, protocol,
+//! address structures) used by both the POSIX syscall layer and the internal
+//! network stack. These types were originally defined in `net/mod.rs` and are
+//! moved here to reduce module size and clarify dependencies.
+
+use core::ffi::c_void;
+
+use smoltcp::wire::{IpAddress, IpEndpoint};
+
+use crate::net::{protocol::iana, socket::socket_err::SocketError};
+
+pub type SocketFd = i32;
+pub type SocketResult = Result<usize, SocketError>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+pub enum SocketDomain {
+    AfInet,
+    AfInet6,
+}
+
+impl TryFrom<i32> for SocketDomain {
+    type Error = SocketError;
+
+    fn try_from(type_c_int: i32) -> Result<Self, Self::Error> {
+        match type_c_int {
+            libc::AF_INET => Ok(SocketDomain::AfInet),
+            libc::AF_INET6 => Ok(SocketDomain::AfInet6),
+            _ => Err(SocketError::UnsupportedSocketDomain(type_c_int as i32)),
+        }
+    }
+}
+
+impl From<SocketDomain> for i32 {
+    fn from(socket_domain: SocketDomain) -> i32 {
+        match socket_domain {
+            SocketDomain::AfInet => libc::AF_INET,
+            SocketDomain::AfInet6 => libc::AF_INET6,
+        }
+    }
+}
+
+impl PartialEq<i32> for SocketDomain {
+    fn eq(&self, other: &i32) -> bool {
+        match self {
+            SocketDomain::AfInet => libc::AF_INET == *other,
+            SocketDomain::AfInet6 => libc::AF_INET6 == *other,
+        }
+    }
+}
+
+impl SocketDomain {
+    pub fn write_to_ptr(
+        &self,
+        option_value: *mut c_void,
+        option_len: *mut libc::socklen_t,
+    ) -> Result<(), i32> {
+        if option_len.is_null() || option_value.is_null() {
+            return Err(-1);
+        }
+
+        let user_len = unsafe { *option_len };
+        let actual_len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+
+        if user_len < actual_len {
+            return Err(-1);
+        }
+
+        let option_value = option_value as *mut i32;
+        unsafe {
+            *option_value = (*self).into();
+            *option_len = actual_len;
+        };
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Copy, PartialOrd, Ord)]
+pub enum SocketType {
+    SockStream, // TCP
+    SockDgram,  // UDP
+    SockRaw,    // ICMPv4/ICMPv6 only
+}
+
+impl TryFrom<i32> for SocketType {
+    type Error = SocketError;
+
+    fn try_from(type_c_int: i32) -> Result<Self, Self::Error> {
+        // Parse the low 8 bits, because type may contain the bitwise-inclusive OR of flags
+        match type_c_int & 0xFF {
+            libc::SOCK_STREAM => Ok(SocketType::SockStream),
+            libc::SOCK_DGRAM => Ok(SocketType::SockDgram),
+            libc::SOCK_RAW => Ok(SocketType::SockRaw),
+            _ => Err(SocketError::UnsupportedSocketType(type_c_int as i32)),
+        }
+    }
+}
+
+impl From<SocketType> for i32 {
+    fn from(socket_type: SocketType) -> i32 {
+        match socket_type {
+            SocketType::SockStream => libc::SOCK_STREAM,
+            SocketType::SockDgram => libc::SOCK_DGRAM,
+            SocketType::SockRaw => libc::SOCK_RAW,
+        }
+    }
+}
+
+impl SocketType {
+    pub fn write_to_ptr(
+        &self,
+        option_value: *mut c_void,
+        option_len: *mut libc::socklen_t,
+    ) -> Result<(), i32> {
+        if option_len.is_null() || option_value.is_null() {
+            return Err(-1);
+        }
+
+        let user_len = unsafe { *option_len };
+        let actual_len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+
+        if user_len < actual_len {
+            return Err(-1);
+        }
+
+        let option_value = option_value as *mut i32;
+        unsafe {
+            *option_value = (*self).into();
+            *option_len = actual_len;
+        };
+
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for SocketType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SocketType::SockStream => write!(f, "SocketType(SockStream)"),
+            SocketType::SockDgram => write!(f, "SocketType(SockDgram)"),
+            SocketType::SockRaw => write!(f, "SocketType(SockRaw)"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+pub enum SocketProtocol {
+    Ip,
+    Ipv6,
+    Icmp,
+    Icmpv6,
+    Raw,
+    Tcp,
+    Udp,
+}
+
+impl TryFrom<i32> for SocketProtocol {
+    type Error = SocketError;
+
+    fn try_from(type_c_int: i32) -> Result<Self, Self::Error> {
+        let socket_protocol = match type_c_int {
+            libc::IPPROTO_IP => SocketProtocol::Ip,
+            libc::IPPROTO_IPV6 => SocketProtocol::Ipv6,
+            libc::IPPROTO_ICMP => SocketProtocol::Icmp,
+            libc::IPPROTO_ICMPV6 => SocketProtocol::Icmpv6,
+            libc::IPPROTO_TCP => SocketProtocol::Tcp,
+            libc::IPPROTO_UDP => SocketProtocol::Udp,
+            _ => return Err(SocketError::UnsupportedSocketProtocol(type_c_int)),
+        };
+        Ok(socket_protocol)
+    }
+}
+
+impl From<SocketProtocol> for i32 {
+    fn from(socket_protocol: SocketProtocol) -> i32 {
+        match socket_protocol {
+            SocketProtocol::Ip => libc::IPPROTO_IP,
+            SocketProtocol::Ipv6 => libc::IPPROTO_IPV6,
+            SocketProtocol::Icmp => libc::IPPROTO_ICMP,
+            SocketProtocol::Icmpv6 => libc::IPPROTO_ICMPV6,
+            SocketProtocol::Tcp => libc::IPPROTO_TCP,
+            SocketProtocol::Udp => libc::IPPROTO_UDP,
+            SocketProtocol::Raw => libc::IPPROTO_RAW,
+        }
+    }
+}
+
+impl SocketProtocol {
+    /// Convert to IANA protocol number for ProtocolRegistry lookup.
+    pub fn iana(&self) -> u8 {
+        match self {
+            SocketProtocol::Tcp => iana::TCP,
+            SocketProtocol::Udp => iana::UDP,
+            SocketProtocol::Icmp => iana::ICMP,
+            SocketProtocol::Icmpv6 => iana::ICMPV6,
+            SocketProtocol::Ip => 0,
+            SocketProtocol::Ipv6 => 41,
+            SocketProtocol::Raw => 255,
+        }
+    }
+
+    pub fn into_ptr(
+        &self,
+        option_value: *mut c_void,
+        option_len: *mut libc::socklen_t,
+    ) -> Result<(), i32> {
+        if option_len.is_null() || option_value.is_null() {
+            return Err(-1);
+        }
+
+        let user_len = unsafe { *option_len };
+        let actual_len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+
+        if user_len < actual_len {
+            return Err(-1);
+        }
+
+        let option_value = option_value as *mut i32;
+        unsafe {
+            *option_value = (*self).into();
+            *option_len = actual_len;
+        };
+
+        Ok(())
+    }
+}
+
+#[repr(C)]
+pub struct SocketAddress {
+    pub sa_len: u8,
+    pub sa_family: libc::sa_family_t,
+    pub sa_data: [libc::c_char; 14],
+}
+
+#[repr(C)]
+pub struct SocketAddressV4 {
+    pub sin_len: u8,
+    pub sin_family: libc::sa_family_t,
+    pub sin_port: libc::in_port_t,
+    pub sin_addr: libc::in_addr,
+    pub sin_vport: libc::in_port_t,
+    pub sin_zero: [u8; 6],
+}
+
+#[repr(C)]
+pub struct SocketAddressV6 {
+    pub sin6_len: u8,
+    pub sin6_family: libc::sa_family_t,
+    pub sin6_port: libc::in_port_t,
+    pub sin6_flowinfo: u32,
+    pub sin6_addr: libc::in6_addr,
+    pub sin6_vport: libc::in_port_t,
+    pub sin6_scope_id: u32,
+}
+
+impl SocketAddress {
+    pub unsafe fn from_ptr<'a>(
+        ptr: *const libc::sockaddr,
+        len: libc::socklen_t,
+    ) -> Option<&'a Self> {
+        if ptr.is_null() || (len as usize) < core::mem::size_of::<libc::sockaddr>() {
+            return None;
+        }
+
+        Some(&*(ptr as *const Self))
+    }
+
+    pub fn create_ip_endpoint(&self) -> Option<IpEndpoint> {
+        match self.sa_family as i32 {
+            libc::AF_INET => {
+                let v4_ptr = self as *const _ as *const SocketAddressV4;
+                (unsafe { v4_ptr.as_ref() }).map(|v4_ref| v4_ref.create_ip_endpoint())
+            }
+            libc::AF_INET6 => {
+                let v6_ptr = self as *const _ as *const SocketAddressV6;
+                (unsafe { v6_ptr.as_ref() }).map(|v6_ref| v6_ref.create_ip_endpoint())
+            }
+            _ => None,
+        }
+    }
+}
+
+impl SocketAddressV4 {
+    pub unsafe fn from_ptr<'a>(
+        ptr: *const libc::sockaddr_in,
+        len: libc::socklen_t,
+    ) -> Option<&'a Self> {
+        if ptr.is_null() || (len as usize) < core::mem::size_of::<libc::sockaddr_in>() {
+            return None;
+        }
+
+        Some(&*(ptr as *const Self))
+    }
+
+    pub fn create_ip_endpoint(&self) -> IpEndpoint {
+        IpEndpoint {
+            addr: IpAddress::Ipv4(core::net::Ipv4Addr::from(
+                self.sin_addr.s_addr.to_ne_bytes(),
+            )),
+            port: u16::from_be(self.sin_port),
+        }
+    }
+}
+
+impl SocketAddressV6 {
+    pub fn create_ip_endpoint(&self) -> IpEndpoint {
+        IpEndpoint {
+            addr: IpAddress::Ipv6(core::net::Ipv6Addr::from(self.sin6_addr.s6_addr)),
+            port: u16::from_be(self.sin6_port),
+        }
+    }
+}
+
+#[cfg(target_pointer_width = "32")]
+type TimevalAbiField = i32;
+#[cfg(target_pointer_width = "64")]
+type TimevalAbiField = i64;
+
+/// BlueOS follows the target C ABI for socket timeval arguments: ILP32 uses
+/// two 32-bit longs and LP64 uses two 64-bit longs.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TimevalAbi {
+    tv_sec: TimevalAbiField,
+    tv_usec: TimevalAbiField,
+}
+
+#[derive(Clone, Copy)]
+pub struct Timeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+impl Timeval {
+    pub unsafe fn from_ptr(ptr: *const c_void, len: libc::socklen_t) -> Option<Self> {
+        if ptr.is_null() || len != core::mem::size_of::<TimevalAbi>() as libc::socklen_t {
+            return None;
+        }
+        let timeval = ptr.cast::<TimevalAbi>().read_unaligned();
+        Self::validated(Self {
+            tv_sec: from_timeval_abi_field(timeval.tv_sec),
+            tv_usec: from_timeval_abi_field(timeval.tv_usec),
+        })
+    }
+
+    pub unsafe fn write_to_ptr(
+        &self,
+        ptr: *mut c_void,
+        len: libc::socklen_t,
+    ) -> Option<libc::socklen_t> {
+        if ptr.is_null() || len != core::mem::size_of::<TimevalAbi>() as libc::socklen_t {
+            return None;
+        }
+        let timeval = TimevalAbi {
+            tv_sec: to_timeval_abi_field(self.tv_sec)?,
+            tv_usec: to_timeval_abi_field(self.tv_usec)?,
+        };
+        ptr.cast::<TimevalAbi>().write_unaligned(timeval);
+        Some(core::mem::size_of::<TimevalAbi>() as libc::socklen_t)
+    }
+
+    fn validated(timeval: Self) -> Option<Self> {
+        if timeval.tv_sec < 0 || !(0..1_000_000).contains(&timeval.tv_usec) {
+            return None;
+        }
+        Some(timeval)
+    }
+}
+
+#[cfg(target_pointer_width = "32")]
+fn from_timeval_abi_field(value: TimevalAbiField) -> i64 {
+    i64::from(value)
+}
+
+#[cfg(target_pointer_width = "64")]
+fn from_timeval_abi_field(value: TimevalAbiField) -> i64 {
+    value
+}
+
+#[cfg(target_pointer_width = "32")]
+fn to_timeval_abi_field(value: i64) -> Option<TimevalAbiField> {
+    i32::try_from(value).ok()
+}
+
+#[cfg(target_pointer_width = "64")]
+fn to_timeval_abi_field(value: i64) -> Option<TimevalAbiField> {
+    Some(value)
+}
+
+crate::static_assert!(size_of::<TimevalAbi>() == 2 * size_of::<usize>());
+
+impl From<core::time::Duration> for Timeval {
+    fn from(duration: core::time::Duration) -> Timeval {
+        let sec = duration.as_secs().min(i64::MAX as u64) as i64;
+        let usec = i64::from(duration.subsec_micros());
+        Timeval {
+            tv_sec: sec,
+            tv_usec: usec,
+        }
+    }
+}
+
+impl From<&Timeval> for core::time::Duration {
+    fn from(timeval: &Timeval) -> Self {
+        core::time::Duration::new(timeval.tv_sec as u64, timeval.tv_usec as u32 * 1_000)
+    }
+}
+
+/// ICMP Message with identifier
+const IDENTIFIER_TYPES: [u8; 10] = [
+    0, // Echo Request
+    8, // Echo Reply
+    13, 14, 15, 16,  // Timestamp / Information X Request / Reply (Deprecated)
+    42,  // Extend Echo Request : Extend Ping (RFC8335)
+    43,  // Extend Echo Reply : Extend Ping (RFC8335)
+    128, // ICMPv6 Echo Request
+    129, // ICMPv6 Echo Reply
+];
+
+#[repr(C)]
+pub struct SocketMsghdr {
+    pub msg_name: *mut libc::c_void,
+    pub msg_namelen: libc::socklen_t,
+    pub msg_iov: *mut libc::iovec,
+    pub msg_iovlen: libc::size_t,
+    pub msg_control: *mut libc::c_void,
+    pub msg_controllen: libc::size_t,
+    pub msg_flags: libc::c_int,
+}
+
+impl core::fmt::Debug for SocketMsghdr {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.debug_struct("SocketMsghdr")
+            .field("msg_name", &self.msg_name)
+            .field("msg_namelen", &self.msg_namelen)
+            .field("msg_iov", &self.msg_iov)
+            .field("msg_iovlen", &self.msg_iovlen)
+            .field("msg_control", &self.msg_control)
+            .field("msg_controllen", &self.msg_controllen)
+            .field("msg_flags", &format_args!("0x{:x}", self.msg_flags))
+            .finish()
+    }
+}
+
+impl SocketMsghdr {
+    pub unsafe fn from_ptr<'a>(ptr: *const libc::msghdr) -> Option<&'a Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(&*(ptr as *const Self))
+        }
+    }
+
+    pub unsafe fn from_ptr_mut<'a>(ptr: *mut libc::msghdr) -> Option<&'a mut Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(&mut *(ptr as *mut SocketMsghdr))
+        }
+    }
+
+    pub fn fill_ip_endpoint(&mut self, endpoint: IpEndpoint) {
+        write_to_sockaddr(
+            endpoint,
+            self.msg_name.cast::<libc::sockaddr>(),
+            &mut self.msg_namelen as *mut libc::socklen_t,
+        );
+    }
+
+    pub fn scatter_from_buffer(&mut self, payload: &[u8]) -> usize {
+        if payload.is_empty() || self.msg_iov.is_null() || self.msg_iovlen == 0 {
+            return 0;
+        }
+
+        let mut remaining = payload;
+        let mut total_copied = 0;
+        for i in 0..(self.msg_iovlen as usize) {
+            // get next iov
+            let iov = unsafe { &*(self.msg_iov).add(i) };
+
+            if iov.iov_base.is_null() || iov.iov_len == 0 {
+                continue;
+            }
+
+            // copy into iov
+            let buffer_len = iov.iov_len as usize;
+            let copy_len = remaining.len().min(buffer_len);
+
+            let dst =
+                unsafe { core::slice::from_raw_parts_mut(iov.iov_base.cast::<u8>(), buffer_len) };
+            let (dst_part, src_part) = (&mut dst[..copy_len], &remaining[..copy_len]);
+
+            dst_part.copy_from_slice(src_part);
+
+            remaining = &remaining[copy_len..];
+            total_copied += copy_len;
+
+            if remaining.is_empty() {
+                break;
+            }
+        }
+
+        total_copied
+    }
+
+    pub fn gather_to_buffer(
+        msg_iov: *const libc::iovec,
+        msg_iovlen: usize,
+        buffer: &mut [u8],
+    ) -> usize {
+        if buffer.is_empty() || msg_iov.is_null() || msg_iovlen == 0 {
+            return 0;
+        }
+
+        let mut destination = buffer;
+        let mut total_copied = 0;
+        for i in 0..(msg_iovlen as usize) {
+            if destination.is_empty() {
+                break;
+            }
+
+            let iov = unsafe { &*msg_iov.add(i) };
+
+            if iov.iov_base.is_null() || iov.iov_len == 0 {
+                continue;
+            }
+
+            let source = unsafe {
+                core::slice::from_raw_parts(iov.iov_base.cast::<u8>(), iov.iov_len as usize)
+            };
+            let copy_len = destination.len().min(source.len());
+
+            destination[..copy_len].copy_from_slice(&source[..copy_len]);
+
+            destination = &mut destination[copy_len..];
+            total_copied += copy_len;
+        }
+
+        total_copied
+    }
+
+    pub fn endpoint(&self) -> Option<IpEndpoint> {
+        unsafe { SocketAddress::from_ptr(self.msg_name as *const libc::sockaddr, self.msg_namelen) }
+            .and_then(|addr| addr.create_ip_endpoint())
+    }
+
+    pub fn packet_len(&self) -> usize {
+        unsafe { core::slice::from_raw_parts(self.msg_iov, self.msg_iovlen as usize) }
+            .iter()
+            .map(|iov| iov.iov_len)
+            .sum()
+    }
+
+    pub fn parse_icmp_identifier(&self) -> Option<u16> {
+        if self.msg_iovlen == 0 {
+            return None;
+        }
+
+        let first = unsafe { &*self.msg_iov };
+        if first.iov_len < 1 {
+            return None;
+        }
+
+        let icmp_type = unsafe { *(first.iov_base as *const u8) };
+
+        // Check ICMP Message Type
+        if !IDENTIFIER_TYPES.contains(&icmp_type) {
+            return None;
+        }
+
+        let mut offset = 0;
+        let mut high_byte = None;
+
+        for i in 0..self.msg_iovlen {
+            let vec = unsafe { &*self.msg_iov.add(i) };
+            let data = unsafe {
+                core::slice::from_raw_parts(vec.iov_base as *const u8, vec.iov_len as usize)
+            };
+
+            if data.is_empty() {
+                continue;
+            }
+
+            let start = 4usize.saturating_sub(offset);
+            let end = 6usize.saturating_sub(offset);
+
+            match () {
+                _ if start < data.len() && end <= data.len() => {
+                    return Some(u16::from_be_bytes([data[start], data[start + 1]]))
+                }
+
+                _ if start < data.len() => high_byte = Some(data[start]),
+
+                _ if !data.is_empty() && high_byte.is_some() => {
+                    return Some(u16::from_be_bytes([high_byte.take().unwrap(), data[0]]))
+                }
+
+                _ => {}
+            }
+
+            offset += data.len();
+        }
+
+        None
+    }
+}
+
+pub fn write_to_sockaddr(
+    endpoint: IpEndpoint,
+    sockaddr_ptr: *mut libc::sockaddr,
+    socklen_ptr: *mut libc::socklen_t,
+) -> Result<(), i32> {
+    if sockaddr_ptr.is_null() || socklen_ptr.is_null() {
+        return Err(-libc::EINVAL);
+    }
+
+    let user_len = unsafe { *socklen_ptr as usize };
+    match endpoint.addr {
+        IpAddress::Ipv4(ipv4) => unsafe {
+            let addr_len = core::mem::size_of::<libc::sockaddr_in>();
+            let mut address: libc::sockaddr_in = core::mem::zeroed();
+            address.sin_len = addr_len as u8;
+            address.sin_family = libc::AF_INET as libc::sa_family_t;
+            address.sin_port = u16::from_be(endpoint.port);
+            address.sin_addr.s_addr = u32::from_ne_bytes(ipv4.octets());
+            core::ptr::copy_nonoverlapping(
+                (&address as *const libc::sockaddr_in).cast::<u8>(),
+                sockaddr_ptr.cast::<u8>(),
+                user_len.min(addr_len),
+            );
+            *socklen_ptr = addr_len as libc::socklen_t;
+        },
+        IpAddress::Ipv6(ipv6) => unsafe {
+            let addr_len = core::mem::size_of::<libc::sockaddr_in6>();
+            let mut address: libc::sockaddr_in6 = core::mem::zeroed();
+            address.sin6_len = addr_len as u8;
+            address.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            address.sin6_port = u16::from_be(endpoint.port);
+            address.sin6_addr.s6_addr = ipv6.octets();
+            core::ptr::copy_nonoverlapping(
+                (&address as *const libc::sockaddr_in6).cast::<u8>(),
+                sockaddr_ptr.cast::<u8>(),
+                user_len.min(addr_len),
+            );
+            *socklen_ptr = addr_len as libc::socklen_t;
+        },
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_test_macro::test;
+    use core::mem::size_of;
+
+    #[test]
+    fn try_from_valid_values() {
+        // test valid values
+        assert_eq!(
+            SocketDomain::try_from(libc::AF_INET).unwrap(),
+            SocketDomain::AfInet
+        );
+        assert_eq!(
+            SocketDomain::try_from(libc::AF_INET6).unwrap(),
+            SocketDomain::AfInet6
+        );
+    }
+
+    #[test]
+    fn try_from_invalid_value() {
+        assert!(matches!(
+            SocketDomain::try_from(-1).unwrap_err(),
+            SocketError::UnsupportedSocketDomain(-1)
+        ));
+    }
+
+    #[test]
+    fn into_c_int() {
+        assert_eq!(libc::AF_INET, SocketDomain::AfInet.into());
+        assert_eq!(libc::AF_INET6, SocketDomain::AfInet6.into());
+    }
+
+    #[test]
+    fn partial_eq_with_c_int() {
+        assert!(SocketDomain::AfInet == libc::AF_INET);
+        assert!(SocketDomain::AfInet6 == libc::AF_INET6);
+        assert!(SocketDomain::AfInet != libc::AF_INET6);
+    }
+
+    #[test]
+    fn timeval_accepts_target_abi_layout() {
+        let value = TimevalAbi {
+            tv_sec: 12,
+            tv_usec: 345_678,
+        };
+
+        let timeval = unsafe {
+            Timeval::from_ptr(
+                (&value as *const TimevalAbi).cast(),
+                size_of::<TimevalAbi>() as libc::socklen_t,
+            )
+        }
+        .unwrap();
+
+        assert_eq!(timeval.tv_sec, 12);
+        assert_eq!(timeval.tv_usec, 345_678);
+    }
+
+    #[test]
+    fn timeval_writes_target_abi_layout() {
+        let timeval = Timeval {
+            tv_sec: 23,
+            tv_usec: 456_789,
+        };
+        let mut value = TimevalAbi {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+
+        let written = unsafe {
+            timeval.write_to_ptr(
+                (&mut value as *mut TimevalAbi).cast(),
+                size_of::<TimevalAbi>() as libc::socklen_t,
+            )
+        };
+
+        assert_eq!(written, Some(size_of::<TimevalAbi>() as libc::socklen_t));
+        assert_eq!(value.tv_sec, 23);
+        assert_eq!(value.tv_usec, 456_789);
+    }
+
+    #[test]
+    fn timeval_rejects_invalid_microseconds() {
+        let value = TimevalAbi {
+            tv_sec: 1,
+            tv_usec: 1_000_000,
+        };
+
+        let timeval = unsafe {
+            Timeval::from_ptr(
+                (&value as *const TimevalAbi).cast(),
+                size_of::<TimevalAbi>() as libc::socklen_t,
+            )
+        };
+
+        assert!(timeval.is_none());
+    }
+
+    #[test]
+    fn timeval_matches_target_c_abi_width() {
+        assert_eq!(size_of::<TimevalAbi>(), 2 * size_of::<usize>());
+    }
+
+    #[test]
+    fn timeval_rejects_non_target_abi_width() {
+        let value = [0u8; 16];
+        let wrong_len = if size_of::<TimevalAbi>() == 8 { 16 } else { 8 };
+
+        let timeval =
+            unsafe { Timeval::from_ptr(value.as_ptr().cast(), wrong_len as libc::socklen_t) };
+
+        assert!(timeval.is_none());
+    }
+
+    #[test]
+    fn timeval_converts_microseconds_to_duration() {
+        let duration = core::time::Duration::from(&Timeval {
+            tv_sec: 2,
+            tv_usec: 345_678,
+        });
+
+        assert_eq!(duration, core::time::Duration::from_micros(2_345_678));
+    }
+
+    #[test]
+    fn write_to_ptr_success() {
+        let domain = SocketDomain::AfInet;
+        let mut value: i32 = 0;
+        let mut len = size_of::<i32>() as libc::socklen_t;
+
+        let result = domain.write_to_ptr(
+            &mut value as *mut _ as *mut c_void,
+            &mut len as *mut libc::socklen_t,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(value, libc::AF_INET);
+        assert_eq!(len, size_of::<i32>() as libc::socklen_t);
+    }
+
+    #[test]
+    fn write_to_ptr_null_buffer() {
+        let domain = SocketDomain::AfInet;
+        let mut len = size_of::<i32>() as libc::socklen_t;
+
+        let result = domain.write_to_ptr(core::ptr::null_mut(), &mut len as *mut libc::socklen_t);
+
+        assert_eq!(result, Err(-1));
+    }
+
+    #[test]
+    fn write_to_ptr_insufficient_len() {
+        let domain = SocketDomain::AfInet;
+        let mut value: i32 = 0;
+        let mut insufficient_len = (size_of::<i32>() - 1) as libc::socklen_t;
+
+        let result = domain.write_to_ptr(
+            &mut value as *mut _ as *mut c_void,
+            &mut insufficient_len as *mut libc::socklen_t,
+        );
+
+        assert_eq!(result, Err(-1));
+    }
+
+    #[test]
+    fn write_to_sockaddr_ipv4() {
+        let endpoint = IpEndpoint::new(
+            IpAddress::Ipv4(core::net::Ipv4Addr::new(127, 0, 0, 1)),
+            8080,
+        );
+        let mut address: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+        let mut len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+        write_to_sockaddr(
+            endpoint,
+            (&mut address as *mut libc::sockaddr_in).cast(),
+            &mut len,
+        )
+        .unwrap();
+
+        assert_eq!(address.sin_family as i32, libc::AF_INET);
+        assert_eq!(u16::from_be(address.sin_port), 8080);
+        assert_eq!(address.sin_addr.s_addr.to_ne_bytes(), [127, 0, 0, 1]);
+        assert_eq!(len as usize, size_of::<libc::sockaddr_in>());
+    }
+
+    #[test]
+    fn write_to_sockaddr_ipv6() {
+        let endpoint = IpEndpoint::new(IpAddress::Ipv6(core::net::Ipv6Addr::LOCALHOST), 8080);
+        let mut address: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
+        let mut len = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+
+        write_to_sockaddr(
+            endpoint,
+            (&mut address as *mut libc::sockaddr_in6).cast(),
+            &mut len,
+        )
+        .unwrap();
+
+        assert_eq!(address.sin6_family as i32, libc::AF_INET6);
+        assert_eq!(u16::from_be(address.sin6_port), 8080);
+        assert_eq!(
+            address.sin6_addr.s6_addr,
+            core::net::Ipv6Addr::LOCALHOST.octets()
+        );
+        assert_eq!(len as usize, size_of::<libc::sockaddr_in6>());
+    }
+}

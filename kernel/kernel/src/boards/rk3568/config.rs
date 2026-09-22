@@ -1,0 +1,30 @@
+// Copyright (c) 2026 vivo Mobile Communication Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::arch::irq::IrqNumber;
+
+pub const APBP_CLOCK: u32 = 0x16e3600;
+pub const CONSOLE_UART_BASE: u64 = 0xFE660000;
+pub const CONSOLE_UART_IRQNUM: IrqNumber = IrqNumber::new(150);
+pub const GENERIC_TIMER_IRQNUM: IrqNumber = IrqNumber::new(30);
+pub const HEAP_SIZE: u64 = 16 * 1024 * 1024;
+pub const PSCI_BASE: u32 = 0x84000000;
+pub const GICD: usize = 0xfd400000;
+pub const GICR: usize = 0xfd460000;
+pub const MMU_L1_NORMAL_BASES: &[u64] = &[0x0, 0x4000_0000];
+pub const MMU_L1_DEVICE_BASES: &[u64] = &[0xc000_0000];
+
+// Physical memory range for buddy allocator (according to uboot bdinfo message).
+pub const PHYS_DRAM_BASE: usize = 0x20_0000;
+pub const PHYS_DRAM_SIZE: usize = 0xefe0_0000;

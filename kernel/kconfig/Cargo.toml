@@ -1,0 +1,12 @@
+[package]
+name = "blue_kconfig"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/load_kconfig.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+cargo-kconfig = "0.1.1"
+enum-iterator = "1.4.0"

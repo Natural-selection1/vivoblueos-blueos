@@ -1,0 +1,37 @@
+# Cortex-M Configuration
+
+menu "Cortex-M Configuration"
+
+config NUM_IRQS
+    int
+
+config USE_MPU
+    bool "MPU supports"
+    default n
+
+if USE_MPU
+    choice
+        prompt "Select MPU Type"
+        help
+          Choose one MPU type. For example, v7 for Cortex-M3, v8 for Cortex-M33
+        config MPU_V8M
+            bool "v8m mpu"
+            help
+              Select MPU_V8M
+    endchoice 
+
+    config MPU_STACK_GUARD
+        bool "MPU stack guard supports"
+        default n
+
+if MPU_STACK_GUARD
+    config STACK_GUARD_ALIGN_AND_SIZE
+        hex "Stack guard align and size"
+        default 0x40 if MPU_V8M
+        help
+          The align and size of Stack guard
+endif
+
+endif
+
+endmenu

@@ -1,0 +1,138 @@
+# Copyright (c) 2025 vivo Mobile Communication Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/templates/build_template.gni")
+
+_kconfig_files = [
+  "config/Kconfig",
+  "//kernel/arch/Kconfig",
+  "//kernel/kernel/src/boards/${board}/Kconfig",
+  "//kernel/kernel/src/Kconfig",
+  "//kernel/kernel/src/allocator/Kconfig",
+  "//kernel/kernel/src/scheduler/Kconfig",
+  "//kernel/kernel/src/vfs/Kconfig",
+  "//kernel/kernel/src/net/Kconfig",
+  "//kernel/kernel/src/devices/Kconfig",
+  "//kernel/arch/riscv/Kconfig",
+  "//kernel/arch/arm/cortex_m/Kconfig",
+  "//kernel/arch/arm/arm64/Kconfig",
+]
+_kconfig_files += string_split(defconfig_files, ",")
+
+action("generate_autoconf") {
+  script = "//kernel/kconfig/src/generate_artifacts.py"
+  inputs = _kconfig_files
+  outputs = [ "${root_gen_dir}/.config" ]
+  args = [
+    "--kconfig",
+    rebase_path("config/Kconfig"),
+    "--board",
+    "${board}",
+    "--build_type",
+    "${build_type}",
+    "--defconfig_files",
+    defconfig_files,
+    "--output_dir",
+    rebase_path("${root_gen_dir}"),
+  ]
+}
+
+action("menuconfig") {
+  script = "//kernel/kconfig/src/menuconfig.py"
+  pool = "//:console($default_toolchain)"
+  inputs = _kconfig_files + get_target_outputs(":generate_autoconf")
+  outputs = [ "${root_gen_dir}/.menuconfig.stamp" ]
+  args = [
+    "--kconfig",
+    rebase_path("config/Kconfig"),
+    "--board",
+    "${board}",
+    "--build_type",
+    "${build_type}",
+    "--config",
+    rebase_path("${root_gen_dir}/.config"),
+  ]
+  deps = [ ":generate_autoconf" ]
+}
+
+action("generate_c_header") {
+  script = "//kernel/kconfig/src/generate_c_header.py"
+  inputs = get_target_outputs(":generate_autoconf")
+  outputs = [ "${root_gen_dir}/autoconf.h" ]
+  config_path = rebase_path(inputs[0])
+  output = rebase_path(outputs[0])
+  args = [
+    "--config",
+    "${config_path}",
+    "--output_headers",
+    "${output}",
+  ]
+  deps = [ ":generate_autoconf" ]
+}
+
+action("generate_rustflags_file") {
+  script = "//kernel/kconfig/src/generate_rustflags_file.py"
+  output_rustflags_dir = rebase_path("${root_gen_dir}")
+  outputs = [ "${root_gen_dir}/rustflags.txt" ]
+  inputs = get_target_outputs(":generate_autoconf")
+  config_path = rebase_path(inputs[0])
+  args = [
+    "--config",
+    "${config_path}",
+    "--output_dir",
+    "${output_rustflags_dir}",
+  ]
+  deps = [ ":generate_autoconf" ]
+}
+
+bindgen("autoconf_header") {
+  bindgen_flags = [
+    "--use-core",
+    "--ctypes-prefix",
+    "core::ffi",
+    "--no-layout-tests",
+  ]
+  inputs = get_target_outputs(":generate_c_header")
+  sources = [ inputs[0] ]
+  deps = [ ":generate_c_header" ]
+}
+
+action("parse_const") {
+  script = "//kernel/kconfig/src/parse_const.py"
+  inputs = get_target_outputs(":autoconf_header")
+  output = rebase_path("${target_gen_dir}/kconfig.rs")
+  input = rebase_path(inputs[0])
+  outputs = [ "${target_gen_dir}/kconfig.rs" ]
+  args = [
+    "--src",
+    "${input}",
+    "--out",
+    "${output}",
+  ]
+  deps = [ ":autoconf_header" ]
+}
+
+build_rust("blueos_kconfig") {
+  crate_type = "rlib"
+  sources = get_target_outputs(":parse_const")
+  edition = "2021"
+  deps = [ ":parse_const" ]
+}
+
+config("kconfigs") {
+  rustflags = []
+  inputs = get_target_outputs(":generate_rustflags_file")
+  rustflags_file = rebase_path(inputs[0])
+  rustflags += [ "@${rustflags_file}" ]
+}

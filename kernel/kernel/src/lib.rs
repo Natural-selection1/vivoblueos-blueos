@@ -1,0 +1,985 @@
+// Copyright (c) 2026 vivo Mobile Communication Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![no_std]
+#![allow(internal_features)]
+#![allow(incomplete_features)]
+#![allow(clippy::crate_in_macro_def)]
+#![allow(clippy::drop_non_drop)]
+#![feature(alloc_error_handler)]
+#![feature(alloc_layout_extra)]
+#![feature(allocator_api)]
+#![feature(associated_type_defaults)]
+#![feature(async_closure)]
+#![feature(box_as_ptr)]
+#![feature(c_size_t)]
+#![feature(c_variadic)]
+#![feature(const_trait_impl)]
+#![feature(core_intrinsics)]
+#![feature(coverage_attribute)]
+#![feature(fn_align)]
+#![feature(generic_arg_infer)]
+#![feature(inherent_associated_types)]
+#![feature(lazy_get)]
+#![feature(let_chains)]
+#![feature(link_llvm_intrinsics)]
+#![feature(linkage)]
+#![feature(macro_metavar_expr)]
+#![feature(map_try_insert)]
+#![feature(naked_functions)]
+#![feature(negative_impls)]
+#![feature(new_zeroed_alloc)]
+#![feature(non_null_from_ref)]
+#![feature(noop_waker)]
+#![feature(pointer_is_aligned_to)]
+#![feature(trait_upcasting)]
+#![feature(trivial_bounds)]
+// Attributes applied when we're testing the kernel.
+#![cfg_attr(test, no_main)]
+#![cfg_attr(test, feature(custom_test_frameworks))]
+#![cfg_attr(test, test_runner(tests::kernel_unittest_runner))]
+#![cfg_attr(test, reexport_test_harness_main = "run_kernel_unittests")]
+
+// #[cfg(test)]
+// blueos_test_macro::test_only!();
+
+extern crate alloc;
+pub mod allocator;
+pub mod arch;
+#[cfg(kernel_async)]
+pub mod asynk;
+pub mod boards;
+#[cfg(use_kernel_boot)]
+pub(crate) mod boot;
+pub mod config;
+pub mod console;
+#[cfg(coverage)]
+pub mod coverage;
+pub(crate) mod devices;
+pub(crate) mod drivers;
+pub mod error;
+pub mod ffi;
+pub mod irq;
+pub mod logger;
+pub mod mm;
+#[cfg(enable_net)]
+pub mod net;
+pub mod scheduler;
+pub mod support;
+pub mod sync;
+pub mod syscall_handlers;
+pub mod thread;
+pub mod time;
+pub mod types;
+#[cfg(enable_vfs)]
+pub mod vfs;
+
+pub use syscall_handlers as syscalls;
+pub(crate) mod signal;
+
+#[macro_export]
+macro_rules! debug {
+    ($($tt:tt)*) => {{}};
+}
+
+pub(crate) static TRACER: spin::Mutex<()> = spin::Mutex::new(());
+
+#[macro_export]
+macro_rules! trace {
+    ($($tt:tt)*) => {{
+        let dig = $crate::support::DisableInterruptGuard::new();
+        let l = $crate::TRACER.lock();
+        #[cfg(target_pointer_width="32")]
+        semihosting::eprint!("[C:{:02} SP:0x{:08x}] ",
+                             $crate::arch::current_cpu_id(),
+                             $crate::arch::current_sp());
+        #[cfg(target_pointer_width="64")]
+        semihosting::eprint!("[C:{:02} SP:0x{:016x}] ",
+                             $crate::arch::current_cpu_id(),
+                             $crate::arch::current_sp());
+        semihosting::eprintln!($($tt)*);
+        drop(l);
+        drop(dig);
+    }};
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    use super::*;
+    use crate as blueos;
+    use crate::{
+        allocator,
+        allocator::KernelAllocator,
+        config,
+        support::DisableInterruptGuard,
+        sync,
+        sync::{wait_until, wake, ConstBarrier},
+        time::Tick,
+        types::Arc,
+    };
+    use alloc::vec::Vec;
+    use blueos_header::syscalls::NR::Nop;
+    use blueos_test_macro::{only_test, test};
+    use core::{
+        mem::MaybeUninit,
+        panic::PanicInfo,
+        ptr,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    #[cfg(use_defmt)]
+    use defmt_rtt as _;
+    use spin::Lazy;
+    use thread::{Entry, SystemThreadStorage, Thread, ThreadKind, ThreadNode};
+
+    #[used]
+    #[link_section = ".bk_app_array"]
+    static INIT_TEST: extern "C" fn() = init_test;
+
+    extern "C" fn test_main() {
+        run_kernel_unittests();
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    const K: usize = 1;
+
+    #[cfg(all(debug_assertions, target_pointer_width = "64"))]
+    pub const K: usize = 1;
+    #[cfg(all(not(debug_assertions), target_pointer_width = "64"))]
+    pub const K: usize = 64;
+
+    const NUM_CORES: usize = blueos_kconfig::CONFIG_NUM_CORES as usize;
+    static mut TEST_THREAD_STORAGES: [SystemThreadStorage; NUM_CORES * K] =
+        [const { SystemThreadStorage::new(ThreadKind::Normal) }; NUM_CORES * K];
+    static mut TEST_THREADS: [MaybeUninit<ThreadNode>; NUM_CORES * K] =
+        [const { MaybeUninit::zeroed() }; NUM_CORES * K];
+
+    static mut MAIN_THREAD_STORAGE: SystemThreadStorage =
+        SystemThreadStorage::new(ThreadKind::Normal);
+    static mut MAIN_THREAD: MaybeUninit<ThreadNode> = MaybeUninit::zeroed();
+
+    fn reset_and_queue_test_thread(
+        i: usize,
+        entry: extern "C" fn(),
+        cleanup: Option<extern "C" fn()>,
+    ) {
+        unsafe {
+            let t = TEST_THREADS[i].assume_init_ref();
+            t.set_preempt_count(0);
+            let mut w = t.lock();
+            let stack = &mut TEST_THREAD_STORAGES[i].stack;
+            let Some(stack) = thread::Stack::from_raw(stack.rep.as_mut_ptr(), stack.rep.len())
+            else {
+                panic!("Invalid stack");
+            };
+            w.init(stack, thread::Entry::C(entry));
+            if let Some(cleanup) = cleanup {
+                w.set_cleanup(Entry::C(cleanup));
+            };
+            let ok = scheduler::queue_ready_thread(w.state(), t.clone());
+            assert_eq!(ok, Ok(()));
+        }
+    }
+
+    fn reset_and_queue_test_threads(entry: extern "C" fn(), cleanup: Option<extern "C" fn()>) {
+        unsafe {
+            for i in 0..TEST_THREADS.len() {
+                reset_and_queue_test_thread(i, entry, cleanup);
+            }
+        }
+    }
+
+    fn init_test_thread(i: usize) {
+        let t = thread::build_static_thread(
+            unsafe { &mut TEST_THREADS[i] },
+            unsafe { &mut TEST_THREAD_STORAGES[i] },
+            config::MAX_THREAD_PRIORITY / 2,
+            thread::IDLE,
+            Entry::C(test_main),
+            ThreadKind::Normal,
+        );
+    }
+
+    extern "C" fn init_test() {
+        let l = unsafe { TEST_THREADS.len() };
+        for i in 0..l {
+            init_test_thread(i);
+        }
+        let t = thread::build_static_thread(
+            unsafe { &mut MAIN_THREAD },
+            unsafe { &mut MAIN_THREAD_STORAGE },
+            config::MAX_THREAD_PRIORITY / 2,
+            thread::IDLE,
+            Entry::C(test_main),
+            ThreadKind::Normal,
+        );
+        let ok = scheduler::queue_ready_thread(thread::IDLE, t.clone());
+        assert_eq!(ok, Ok(()));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    const EMBALLOC_SIZE: usize = 8 << 20;
+    #[cfg(target_pointer_width = "32")]
+    const EMBALLOC_SIZE: usize = 2 << 20;
+
+    #[global_allocator]
+    static ALLOCATOR: KernelAllocator = KernelAllocator;
+    // Emballoc is for correctness reference.
+    //static ALLOCATOR: emballoc::Allocator<{ EMBALLOC_SIZE }> = emballoc::Allocator::new();
+
+    #[panic_handler]
+    fn oops(info: &PanicInfo) -> ! {
+        let _guard = DisableInterruptGuard::new();
+        #[cfg(not(use_defmt))]
+        {
+            semihosting::println!("{}", info);
+            semihosting::println!("Oops: {}", info.message());
+            let mem_info = allocator::memory_info();
+            semihosting::println!(
+                "Memory: total={} used={} max={}",
+                mem_info.total,
+                mem_info.used,
+                mem_info.max_used
+            );
+        }
+
+        #[cfg(use_defmt)]
+        {
+            defmt::error!("{}", defmt::Display2Format(info));
+            defmt::error!("Oops: {}", defmt::Display2Format(&info.message()));
+            let mem_info = allocator::memory_info();
+            defmt::error!(
+                "Memory: total={} used={} max={}",
+                mem_info.total,
+                mem_info.used,
+                mem_info.max_used
+            );
+        }
+        loop {}
+    }
+
+    #[test]
+    fn test_spinlock() {
+        let lock = sync::spinlock::SpinLock::new(0);
+        let mut w = lock.irqsave_lock();
+        *w = 1;
+        drop(w);
+
+        assert!(scheduler::current_thread().validate_sp());
+        scheduler::yield_me_now_or_later();
+        assert!(scheduler::current_thread().validate_sp());
+
+        let r = lock.irqsave_lock();
+        assert_eq!(*r, 1);
+    }
+
+    #[test]
+    fn test_spinlock_loop() {
+        let lock = sync::spinlock::SpinLock::new(0);
+        loop {
+            let mut w = lock.irqsave_lock();
+            *w += 1;
+            drop(w);
+
+            scheduler::yield_me_now_or_later();
+
+            let r = lock.irqsave_lock();
+            if *r == 100 {
+                break;
+            }
+        }
+    }
+
+    #[cfg(cortex_m)]
+    #[test]
+    fn test_sys_tick() {
+        let tick = Tick::now();
+        assert!(scheduler::current_thread().validate_sp());
+        scheduler::suspend_me_for::<()>(Tick(10), None);
+        assert!(scheduler::current_thread().validate_sp());
+        let tick2 = Tick::now();
+        assert!(tick2.0 - tick.0 >= 10);
+        assert!(tick2.0 - tick.0 <= 11);
+    }
+
+    // In esp32c3, we use usb-serial as the console output,
+    // which does not support on qemu yet, so we skip this test on esp32c3 for now.
+    // See https://github.com/espressif/esp-toolchain-docs/blob/main/qemu/README.md
+    #[cfg_attr(not(any(soc_esp32c3, soc_esp32c6)), test)]
+    fn test_early_printk() {
+        kearly_println!("Hello from early_printk!");
+    }
+
+    #[test]
+    fn test_local_irq() {
+        assert!(arch::local_irq_enabled());
+    }
+
+    #[test(thread = 2, repeat = 2)]
+    fn test_harness_thread_attribute() {
+        static ARRIVED: AtomicUsize = AtomicUsize::new(0);
+
+        let arrived = ARRIVED.fetch_add(1, Ordering::AcqRel) + 1;
+        let target = if arrived % 2 == 0 {
+            arrived
+        } else {
+            arrived + 1
+        };
+        while ARRIVED.load(Ordering::Acquire) < target {
+            scheduler::yield_me();
+        }
+    }
+
+    #[cfg(mpu_stack_guard)]
+    extern "C" {
+        static __sys_stack_guard_start: u8;
+    }
+
+    #[cfg(mpu_stack_guard)]
+    static MEMFAULT_TRIGGERED: AtomicBool = AtomicBool::new(false);
+
+    #[cfg(mpu_stack_guard)]
+    fn thumb_instruction_len(pc: usize) -> usize {
+        let first_halfword = unsafe { (pc as *const u16).read_volatile() };
+        if (first_halfword & 0xF800) == 0xE800 || (first_halfword & 0xF000) == 0xF000 {
+            4
+        } else {
+            2
+        }
+    }
+
+    #[cfg(mpu_stack_guard)]
+    #[inline]
+    const fn align_up(addr: usize, align: usize) -> usize {
+        (addr + align - 1) & !(align - 1)
+    }
+
+    #[cfg(mpu_stack_guard)]
+    extern "C" fn handle_memfault_impl(ctx: &mut crate::arch::IsrContext) {
+        let scb = unsafe { &*cortex_m::peripheral::SCB::PTR };
+        let cfsr = scb.cfsr.read();
+        // MMFSR is in CFSR[7:0].
+        assert_ne!(
+            cfsr & 0xff,
+            0,
+            "MemManage handler entered without MMFSR status"
+        );
+        assert_ne!(
+            cfsr & (1 << 1),
+            0,
+            "MemManage triggered but DACCVIOL is not set"
+        );
+        MEMFAULT_TRIGGERED.store(true, Ordering::Release);
+        // Clear MMFSR bits and skip the faulting instruction.
+        unsafe { scb.cfsr.write(cfsr & 0xff) };
+        ctx.pc = ctx.pc.wrapping_add(thumb_instruction_len(ctx.pc));
+    }
+
+    #[cfg(mpu_stack_guard)]
+    #[naked]
+    #[no_mangle]
+    pub unsafe extern "C" fn handle_memfault() {
+        core::arch::naked_asm!(
+            "
+            mrs r0, msp
+            tst lr, #0x04
+            beq 1f
+            mrs r0, psp
+            1:
+            b {handler}
+            ",
+            handler = sym handle_memfault_impl
+        )
+    }
+
+    #[cfg(mpu_stack_guard)]
+    #[test]
+    fn test_mpu_sys_stack_guard_write_fault() {
+        MEMFAULT_TRIGGERED.store(false, Ordering::Release);
+        let addr = unsafe { core::ptr::addr_of!(__sys_stack_guard_start) as *mut u32 };
+        unsafe { core::ptr::write_volatile(addr, 0x5A5A_A5A5) };
+        assert!(
+            MEMFAULT_TRIGGERED.load(Ordering::Acquire),
+            "MPU guard write did not trigger MemManage"
+        );
+    }
+
+    #[cfg(mpu_stack_guard)]
+    #[test]
+    fn test_mpu_thread_stack_guard_write_fault() {
+        const MPU_REGION_ALIGN: usize = 32;
+        let current = scheduler::current_thread_ref();
+        let guard_size = blueos_kconfig::CONFIG_STACK_GUARD_ALIGN_AND_SIZE as usize;
+        assert!(
+            guard_size >= MPU_REGION_ALIGN && guard_size % MPU_REGION_ALIGN == 0,
+            "Invalid stack guard size: {guard_size}"
+        );
+
+        let stack_base = current.stack_base();
+        let stack_top = stack_base + current.stack_size();
+        let guard_start = align_up(stack_base, MPU_REGION_ALIGN);
+        assert!(
+            guard_start < stack_top,
+            "No valid guard start in stack range"
+        );
+
+        MEMFAULT_TRIGGERED.store(false, Ordering::Release);
+        unsafe { core::ptr::write_volatile(guard_start as *mut u32, 0xA5A5_5A5A) };
+        assert!(
+            MEMFAULT_TRIGGERED.load(Ordering::Acquire),
+            "Per-thread MPU stack guard write did not trigger MemManage"
+        );
+    }
+
+    #[test]
+    fn stress_trap() {
+        #[cfg(target_pointer_width = "32")]
+        let n = 16;
+        #[cfg(target_pointer_width = "64")]
+        let n = 256;
+        for _i in 0..n {
+            #[cfg(any(target_arch = "riscv64", target_arch = "riscv32"))]
+            unsafe {
+                core::arch::asm!(
+                    "ecall",
+                    in("a7") Nop as usize,
+                    inlateout("a0") 0 => _,
+                    options(nostack),
+                );
+            };
+        }
+    }
+
+    #[derive(Default)]
+    struct CleanupCounter {
+        counter: AtomicUsize,
+    }
+
+    impl CleanupCounter {
+        pub const fn new() -> Self {
+            Self {
+                counter: AtomicUsize::new(0),
+            }
+        }
+        pub fn spin_until_eq(&self, n: usize) {
+            while self.counter.load(Ordering::Relaxed) != n {
+                scheduler::yield_me();
+            }
+        }
+        pub fn increment(&self) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+        pub fn reset(&self) {
+            self.counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    static SEMA_CLEANUP_COUNTER: CleanupCounter = CleanupCounter::new();
+    static mut SEMA_COUNTER: usize = 0usize;
+    static SEMA: sync::semaphore::Semaphore = sync::semaphore::Semaphore::new();
+
+    extern "C" fn test_semaphore() {
+        SEMA.acquire_notimeout::<scheduler::InsertToEnd>();
+        let n = unsafe { SEMA_COUNTER };
+        unsafe { SEMA_COUNTER += 1 };
+        SEMA.release();
+    }
+
+    extern "C" fn test_semaphore_cleanup() {
+        SEMA_CLEANUP_COUNTER.increment();
+    }
+
+    #[test]
+    fn stress_semaphore() {
+        SEMA_CLEANUP_COUNTER.reset();
+        unsafe { SEMA_COUNTER = 0 };
+        SEMA.init(1);
+        reset_and_queue_test_threads(test_semaphore, Some(test_semaphore_cleanup));
+        let l = unsafe { TEST_THREADS.len() };
+        loop {
+            SEMA.acquire_notimeout::<scheduler::InsertToEnd>();
+            let n = unsafe { SEMA_COUNTER };
+            if n == l {
+                SEMA.release();
+                break;
+            }
+            SEMA.release();
+            scheduler::yield_me();
+        }
+        SEMA_CLEANUP_COUNTER.spin_until_eq(l);
+    }
+
+    static ATOMIC_WAIT_CLEANUP: CleanupCounter = CleanupCounter::new();
+    static TEST_ATOMIC_WAIT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn test_atomic_wait_cleanup() {
+        ATOMIC_WAIT_CLEANUP.increment();
+    }
+
+    extern "C" fn test_atomic_wait() {
+        TEST_ATOMIC_WAIT.fetch_add(1, Ordering::Release);
+        sync::atomic_wait::atomic_wake(&TEST_ATOMIC_WAIT, 1);
+    }
+
+    #[test]
+    fn stress_atomic_wait() {
+        reset_and_queue_test_threads(test_atomic_wait, Some(test_atomic_wait_cleanup));
+        let l = unsafe { TEST_THREADS.len() };
+        loop {
+            let n = TEST_ATOMIC_WAIT.load(Ordering::Acquire);
+            if n == l {
+                break;
+            }
+            sync::atomic_wait::atomic_wait(&TEST_ATOMIC_WAIT, n, Tick::MAX);
+        }
+        ATOMIC_WAIT_CLEANUP.spin_until_eq(l);
+    }
+
+    static MUTEX_CLEANUP: CleanupCounter = CleanupCounter::new();
+    static_arc! {
+        MUTEX(sync::mutex::Mutex, sync::mutex::Mutex::new()),
+    }
+    static mut MUTEX_COUNTER: usize = 0usize;
+
+    extern "C" fn test_mutex() {
+        MUTEX.pend_for(Tick::MAX);
+        unsafe { MUTEX_COUNTER += 1 };
+        MUTEX.post();
+    }
+
+    extern "C" fn test_mutex_cleanup() {
+        MUTEX_CLEANUP.increment();
+    }
+
+    #[test]
+    fn stress_mutex() {
+        MUTEX.init();
+        reset_and_queue_test_threads(test_mutex, Some(test_mutex_cleanup));
+        let l = unsafe { TEST_THREADS.len() };
+        loop {
+            MUTEX.pend_for(Tick::MAX);
+            let n = unsafe { MUTEX_COUNTER };
+            if n == l {
+                MUTEX.post();
+                break;
+            }
+            MUTEX.post();
+            scheduler::yield_me();
+        }
+        MUTEX_CLEANUP.spin_until_eq(l);
+    }
+
+    static MQUEUE: Lazy<Arc<sync::mqueue::MessageQueue>> =
+        Lazy::new(|| Arc::new(sync::mqueue::MessageQueue::new(4, 2, ptr::null_mut())));
+    static TEST_SEND_CNT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn test_mqueue() {
+        let buffer = [1u8; 4];
+        let result = MQUEUE.send(&buffer, 4, Tick(512), sync::mqueue::SendMode::Normal);
+        assert!(result.is_ok());
+    }
+
+    extern "C" fn test_mqueue_cleanup() {
+        TEST_SEND_CNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // FIXME: We have performance issue on SMP. See
+    // https://github.com/vivoblueos/kernel/issues/111 for details.
+    #[cfg_attr(not(target_board = "qemu_riscv64"), test)]
+    #[cfg_attr(target_board = "qemu_riscv64", blueos_test_macro::ignore)]
+    fn stress_mqueue() {
+        MQUEUE.init();
+        reset_and_queue_test_threads(test_mqueue, Some(test_mqueue_cleanup));
+        let l = unsafe { TEST_THREADS.len() };
+        let mut recv_cnt = 0;
+        let mut buffer = [0u8; 4];
+        loop {
+            if recv_cnt == l {
+                break;
+            }
+            let result = MQUEUE.recv(&mut buffer, 4, Tick(512));
+            recv_cnt += 1;
+            assert!(result.is_ok());
+            assert_eq!(buffer, [1u8, 1u8, 1u8, 1u8]);
+            scheduler::relinquish_me();
+        }
+        while TEST_SEND_CNT.load(Ordering::Acquire) != l {}
+    }
+
+    static TEST_SWITCH_CONTEXT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn test_switch_context() {
+        let n = 4;
+        for _i in 0..n {
+            assert!(scheduler::current_thread().validate_sp());
+            scheduler::yield_me();
+            assert!(scheduler::current_thread().validate_sp());
+        }
+    }
+
+    extern "C" fn test_switch_context_cleanup() {
+        TEST_SWITCH_CONTEXT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stress_context_switch() {
+        reset_and_queue_test_threads(test_switch_context, Some(test_switch_context_cleanup));
+        loop {
+            let n = TEST_SWITCH_CONTEXT.load(Ordering::Relaxed);
+            if n == unsafe { TEST_THREADS.len() } {
+                break;
+            }
+            assert!(scheduler::current_thread().validate_sp());
+            scheduler::yield_me();
+            assert!(scheduler::current_thread().validate_sp());
+        }
+    }
+
+    static BUILT_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn do_it() {
+        BUILT_THREADS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stress_build_threads() {
+        #[cfg(target_pointer_width = "32")]
+        let n = blueos_kconfig::CONFIG_UNITTEST_THREAD_NUM as usize / 2;
+        #[cfg(all(debug_assertions, target_pointer_width = "64"))]
+        let n = 32;
+        #[cfg(all(not(debug_assertions), target_pointer_width = "64"))]
+        let n = 512;
+        for _i in 0..n {
+            let t = thread::Builder::new(thread::Entry::C(do_it)).build();
+            let ok = scheduler::queue_ready_thread(t.state(), t);
+            assert_eq!(ok, Ok(()));
+        }
+        loop {
+            let m = BUILT_THREADS.load(Ordering::Relaxed);
+            if m == n {
+                break;
+            }
+            scheduler::yield_me();
+        }
+    }
+
+    static SPAWNED_THREADS: AtomicUsize = AtomicUsize::new(0);
+    #[test]
+    fn stress_spawn_threads() {
+        #[cfg(target_pointer_width = "32")]
+        let n = blueos_kconfig::CONFIG_UNITTEST_THREAD_NUM as usize / 2;
+        #[cfg(all(debug_assertions, target_pointer_width = "64"))]
+        let n = 32;
+        #[cfg(all(not(debug_assertions), target_pointer_width = "64"))]
+        let n = 512;
+        for _i in 0..n {
+            thread::spawn(move || {
+                SPAWNED_THREADS.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        loop {
+            let m = SPAWNED_THREADS.load(Ordering::Relaxed);
+            if m == n {
+                break;
+            }
+            scheduler::yield_me();
+        }
+    }
+
+    // Should not hang.
+    #[test]
+    fn test_simple_signal() {
+        let a = Arc::new(ConstBarrier::<{ 2 }>::new());
+        let b = Arc::new(AtomicUsize::new(0));
+        let closure = {
+            let a = a.clone();
+            let b = b.clone();
+            move || {
+                a.wait();
+                sync::atomic_wait::atomic_wait(&b, 0, Tick::MAX);
+            }
+        };
+        let t = crate::thread::spawn(closure).unwrap();
+        // Send SIGTERM after t enters its entry function.
+        a.wait();
+        // FIXME: Memory leaks since we are using a boxed closure as t's entry.
+        t.lock().kill(libc::SIGTERM as i32);
+        // At this point, t is either
+        // 0: waking up from "a" or
+        // 1: is suspended on "b".
+        // We solve both cases by invoking yield_me and atomic_wake, which
+        // should not hang.
+        b.store(1, Ordering::Release);
+        sync::atomic_wait::atomic_wake(&b, 1);
+        scheduler::yield_me();
+    }
+
+    async fn foo(i: usize) -> usize {
+        i
+    }
+
+    async fn bar() -> usize {
+        42
+    }
+
+    async fn is_asynk_working() {
+        let a = foo(42).await;
+        let b = bar().await;
+        assert_eq!(a - b, 0);
+    }
+
+    #[test]
+    fn stress_async_basic() {
+        let n = 1024;
+        for _i in 0..n {
+            asynk::block_on(is_asynk_working());
+        }
+    }
+
+    async fn yield_now() {
+        asynk::yield_now().await;
+    }
+
+    #[test]
+    fn test_yield_now() {
+        asynk::block_on(yield_now());
+    }
+
+    #[cfg(target_abi = "eabihf")]
+    #[test]
+    fn test_basic_float_add_sub() {
+        let a: f32 = 1.0;
+        let b = 2.0;
+        let c = 3.0;
+        let epsilon = 1e-6;
+        assert!((a + b - c).abs() <= epsilon);
+    }
+
+    #[cfg(target_abi = "eabihf")]
+    #[test]
+    fn test_basic_float_mul_div() {
+        let a: f32 = 2.0;
+        let b = 3.0;
+        let c = 6.0;
+        let epsilon = 1e-6;
+        assert!((a * b / c - 1.0).abs() <= epsilon);
+    }
+
+    #[inline(never)]
+    pub fn kernel_unittest_runner(tests: &[&dyn Fn()]) {
+        let t = scheduler::current_thread();
+        #[cfg(use_defmt)]
+        use defmt::println;
+        #[cfg(not(use_defmt))]
+        use semihosting::println;
+
+        println!("---- Running {} kernel unittests...", tests.len());
+        #[cfg(use_defmt)]
+        println!(
+            "Before test, thread 0x{:x}, rc: {}, heap status: {:?}, sp: 0x{:x}",
+            Thread::id(&t),
+            ThreadNode::strong_count(&t),
+            defmt::Debug2Format(&allocator::memory_info()),
+            arch::current_sp(),
+        );
+        #[cfg(not(use_defmt))]
+        println!(
+            "Before test, thread 0x{:x}, rc: {}, heap status: {:?}, sp: 0x{:x}",
+            Thread::id(&t),
+            ThreadNode::strong_count(&t),
+            allocator::memory_info(),
+            arch::current_sp(),
+        );
+        for test in tests {
+            test();
+        }
+        #[cfg(use_defmt)]
+        println!(
+            "After test, thread 0x{:x}, heap status: {:?}, sp: 0x{:x}",
+            Thread::id(&t),
+            defmt::Debug2Format(&allocator::memory_info()),
+            arch::current_sp()
+        );
+        #[cfg(not(use_defmt))]
+        println!(
+            "After test, thread 0x{:x}, heap status: {:?}, sp:  0x{:x}",
+            Thread::id(&t),
+            allocator::memory_info(),
+            arch::current_sp()
+        );
+        println!("---- Done kernel unittests.");
+        #[cfg(coverage)]
+        crate::coverage::write_coverage_data();
+        #[cfg(use_defmt)]
+        cortex_m_semihosting::debug::exit(cortex_m_semihosting::debug::EXIT_SUCCESS);
+    }
+
+    #[cfg(event_flags)]
+    static EVENT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(event_flags)]
+    static EVENT: sync::event_flags::EventFlags = sync::event_flags::EventFlags::new();
+    #[cfg(event_flags)]
+    extern "C" fn test_event_flags() {
+        EVENT.wait::<scheduler::InsertToEnd>(
+            1 << 0,
+            sync::event_flags::EventFlagsMode::ANY,
+            Tick(100),
+        );
+    }
+    #[cfg(event_flags)]
+    extern "C" fn test_event_flags_cleanup() {
+        EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(event_flags)]
+    #[test]
+    fn stress_event_flags() {
+        EVENT.init(0);
+        reset_and_queue_test_threads(test_event_flags, Some(test_event_flags_cleanup));
+        let l = unsafe { TEST_THREADS.len() };
+        loop {
+            EVENT.set(1 << 0);
+            let n = EVENT_COUNTER.load(Ordering::Relaxed);
+            if n == l {
+                break;
+            }
+            scheduler::yield_me();
+        }
+    }
+
+    extern "C" fn test_sched_timers() {
+        scheduler::suspend_me_for::<()>(Tick(10), None);
+    }
+
+    extern "C" fn test_sched_timers_cleanup() {
+        SCHED_TIMERS_CLEANUP.increment();
+    }
+
+    static SCHED_TIMERS_CLEANUP: CleanupCounter = CleanupCounter::new();
+
+    #[test]
+    fn stress_sched_timers() {
+        reset_and_queue_test_threads(test_sched_timers, Some(test_sched_timers_cleanup));
+        let l = unsafe { TEST_THREADS.len() };
+        SCHED_TIMERS_CLEANUP.spin_until_eq(l);
+    }
+
+    static ALLOCATOR_STRESS_THREAD1_DONE: AtomicUsize = AtomicUsize::new(0);
+    static ALLOCATOR_STRESS_THREAD2_DONE: AtomicUsize = AtomicUsize::new(0);
+    const MAX_TEST_HEAP_SIZE: usize = 8 * 1024 * 1024;
+    fn alloc_test() {
+        // Get memory info and calculate test size
+        let mem_info = allocator::memory_info();
+        let available = mem_info.total.saturating_sub(mem_info.used);
+        let test_size = core::cmp::min(available * 3 / 4, MAX_TEST_HEAP_SIZE);
+
+        // Test with different allocation sizes
+        let sizes = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+        let mut allocations: Vec<Vec<u8>> = Vec::new();
+        let mut current_used = 0;
+
+        // Allocate memory in chunks
+        for _iter in 0..1000 {
+            for &size in &sizes {
+                // More aggressive memory management
+                if current_used > test_size / 2 {
+                    allocations.clear();
+                    current_used = 0;
+                }
+
+                let vec = alloc::vec::Vec::<u8>::with_capacity(size);
+                allocations.push(vec);
+                current_used += size;
+
+                // Yield to allow other thread to run
+                scheduler::relinquish_me();
+            }
+        }
+
+        // Clean up remaining allocations
+        drop(allocations);
+    }
+
+    extern "C" fn allocator_stress_thread1() {
+        alloc_test();
+        ALLOCATOR_STRESS_THREAD1_DONE.store(1, Ordering::Release);
+        wake(&ALLOCATOR_STRESS_THREAD1_DONE);
+    }
+
+    extern "C" fn allocator_stress_thread2() {
+        alloc_test();
+        ALLOCATOR_STRESS_THREAD2_DONE.store(1, Ordering::Release);
+        wake(&ALLOCATOR_STRESS_THREAD2_DONE);
+    }
+
+    #[test]
+    fn stress_allocator() {
+        // Get initial memory info
+        let initial_info = allocator::memory_info();
+        let available = initial_info.total.saturating_sub(initial_info.used);
+        let test_size = (available * 3) / 4;
+        assert!(test_size > 0, "Not enough available memory for stress test");
+
+        // Reset completion flags
+        ALLOCATOR_STRESS_THREAD1_DONE.store(0, Ordering::Release);
+        ALLOCATOR_STRESS_THREAD2_DONE.store(0, Ordering::Release);
+
+        // Start two threads for concurrent allocation/deallocation
+        let t1 = thread::Builder::new(thread::Entry::C(allocator_stress_thread1))
+            .set_priority(config::MAX_THREAD_PRIORITY / 2)
+            .build();
+        let ok1 = scheduler::queue_ready_thread(t1.state(), t1);
+        assert_eq!(ok1, Ok(()));
+
+        let t2 = thread::Builder::new(thread::Entry::C(allocator_stress_thread2))
+            .set_priority(config::MAX_THREAD_PRIORITY / 2)
+            .build();
+        let ok2 = scheduler::queue_ready_thread(t2.state(), t2);
+        assert_eq!(ok2, Ok(()));
+
+        // Wait for both threads to complete
+        wait_until(1, &ALLOCATOR_STRESS_THREAD1_DONE);
+        wait_until(1, &ALLOCATOR_STRESS_THREAD2_DONE);
+
+        #[cfg(allocator = "slab_dynamic")]
+        {
+            allocator::reclaim_page_pool();
+        }
+
+        let final_info = allocator::memory_info();
+        // Memory should be back to a reasonable state (allowing for some fragmentation)
+        assert!(
+            final_info.used <= initial_info.used + test_size / 10,
+            "Memory usage after stress test is too high: initial_used={}, final_used={}, test_size={}",
+            initial_info.used,
+            final_info.used,
+            test_size
+        );
+    }
+
+    // The test always panicks since we are using 0xdeadbeef as magic number.
+    #[blueos_test_macro::ignore]
+    fn test_always_double_free() {
+        let mut spray_vecs = alloc::vec::Vec::new();
+        for size in (32..256).step_by(8) {
+            for _ in 0..20 {
+                let num_usizes = size / core::mem::size_of::<usize>();
+                let mut spray = alloc::vec![0usize; num_usizes];
+                for i in 0..num_usizes {
+                    spray[i] = 0xDEAD_BEEF;
+                }
+                spray_vecs.push(spray);
+            }
+        }
+    }
+}

@@ -1,0 +1,222 @@
+// Copyright (c) 2025 vivo Mobile Communication Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#[cfg(kernel_async)]
+use crate::asynk;
+#[cfg(enable_net)]
+use crate::net;
+#[cfg(enable_vfs)]
+use crate::vfs;
+use crate::{
+    allocator, arch, boards,
+    devices::{
+        console,
+        tty::{n_tty::Tty, termios::Termios},
+        DeviceManager,
+    },
+    logger, scheduler,
+    sync::SpinLock,
+    thread, time,
+};
+use alloc::{string::String, sync::Arc};
+use blueos_driver::uart::UartConfig;
+use blueos_hal::{Configuration, PlatPeri};
+use core::ptr::{addr_of, addr_of_mut};
+use spin::Once;
+
+// We have to put these globals in the .data section. If not specified explicitly,
+// they might be put in the .bss section and might be used before they are initialized.
+#[link_section = ".data"]
+pub(crate) static mut INIT_BSS_DONE: bool = false;
+#[link_section = ".data"]
+pub(crate) static mut INIT_ARRAY_DONE: bool = false;
+#[link_section = ".data"]
+pub(crate) static mut INIT_HEAP_DONE: bool = false;
+#[link_section = ".data"]
+pub(crate) static mut INIT_VFS_DONE: bool = false;
+
+// See https://github.com/rust-lang/rust/pull/134213 for more details about naked function.
+#[no_mangle]
+#[naked]
+pub unsafe extern "C" fn _start() {
+    // Arch is responsible to init cores. After initializing
+    // cores, arch_bootstrap should continue with `init`.
+    crate::arch_bootstrap!(__sys_stack_start, __sys_stack_end, init);
+}
+
+extern "C" {
+    pub static __init_array_start: extern "C" fn();
+    pub static __init_array_end: extern "C" fn();
+    // Apps' entries should be put in bk_app_array section.
+    pub static __bk_app_array_start: extern "C" fn();
+    pub static __bk_app_array_end: extern "C" fn();
+    pub static mut __bss_start: u8;
+    pub static mut __bss_end: u8;
+    pub static mut __sys_stack_start: u8;
+    pub static mut __sys_stack_end: u8;
+    pub static mut __heap_start: u8;
+    pub static mut __heap_end: u8;
+    pub static mut _end: u8;
+}
+
+use crate::{
+    devices::{bus::Bus, i2c_core::block_i2c::BlockI2c},
+    drivers::InitDriver,
+};
+
+fn init_pin_states<P: blueos_hal::pinctrl::AlterFuncPin>(pin_states: &[&P]) {
+    for pin_state in pin_states {
+        pin_state.init();
+    }
+}
+
+extern "C" fn init() {
+    boards::init();
+    init_heap();
+    init_runtime();
+    init_pin_states(crate::boards::PIN_STATES);
+
+    // FIXME: 4KB paging can only be used after heap initialization is complete.
+    // This call is used to verify that 4KB paging works correctly; perhaps it can be removed later?
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::mmu::init_el1_runtime_linearmap()
+        .expect("failed to initialize AArch64 EL1 runtime 4KB linearmap");
+
+    let uart = crate::boards::get_device!(console_uart);
+    uart.configure(&UartConfig::default()).unwrap();
+    uart.enable();
+
+    let tty0 = Tty::init(&crate::drivers::serial::TTY_SERIAL, Termios::default());
+    DeviceManager::get().register_device(String::from("ttyS0"), tty0.clone());
+    match console::init_console(tty0.clone()) {
+        Ok(_) => {}
+        Err(err) => panic!("Failed to init console: {}", crate::error::Error::from(err)),
+    }
+
+    #[cfg(virtio)]
+    {
+        use crate::devices::virtio;
+        use flat_device_tree::Fdt;
+        // initialize fdt
+        // SAFETY: We trust that the FDT pointer we were given is valid, and this is the only time we
+        // use it.
+        let fdt = unsafe { Fdt::from_ptr(crate::boards::DRAM_BASE as *const u8).unwrap() };
+        // initialize virtio
+        virtio::init_virtio(&fdt);
+    }
+    #[cfg(spi_core)]
+    crate::boards::init_spi_bus();
+    #[cfg(i2c_core)]
+    crate::boards::init_i2c_bus();
+    #[cfg(gpio)]
+    crate::boards::init_gpio();
+
+    #[cfg(enable_vfs)]
+    init_vfs();
+
+    scheduler::init();
+    logger::logger_init();
+    time::timer::init();
+    #[cfg(kernel_async)]
+    asynk::init();
+    #[cfg(enable_net)]
+    {
+        net::init();
+        net::net_manager::init();
+    }
+
+    // it's an bug in fact, but at now we use a workaround let newlib do the c++ runtime initialization
+    #[cfg(not(target_board = "newlib_mps3_an547"))]
+    run_init_array();
+
+    init_apps();
+
+    arch::start_schedule(scheduler::schedule);
+    unreachable!("We should have jumped to the schedule loop!");
+}
+
+pub(crate) fn init_runtime() {
+    init_bss();
+}
+
+#[cfg(enable_vfs)]
+pub(crate) fn init_vfs() {
+    unsafe {
+        if INIT_VFS_DONE {
+            return;
+        }
+        if let Err(err) = vfs::vfs_init() {
+            panic!("{}", err);
+        };
+        INIT_VFS_DONE = true;
+    }
+}
+
+#[inline]
+fn init_bss() {
+    unsafe {
+        if INIT_BSS_DONE {
+            return;
+        }
+        // FIXME: Use memset?
+        let mut ptr = addr_of_mut!(__bss_start);
+        while ptr != addr_of_mut!(__bss_end) {
+            ptr.write(0u8);
+            ptr = ptr.offset(1);
+        }
+        INIT_BSS_DONE = true;
+    }
+}
+
+#[inline(never)]
+pub(crate) fn run_init_array() {
+    unsafe {
+        if INIT_ARRAY_DONE {
+            return;
+        }
+        let mut my_init = addr_of!(__init_array_start);
+        while my_init < addr_of!(__init_array_end) {
+            (*my_init)();
+            my_init = my_init.offset(1);
+        }
+        INIT_ARRAY_DONE = true;
+    }
+}
+
+#[inline(never)]
+fn init_apps() {
+    unsafe {
+        let mut app = addr_of!(__bk_app_array_start);
+        while app < addr_of!(__bk_app_array_end) {
+            let stack =
+                thread::Stack::from_size(blueos_kconfig::CONFIG_MAIN_THREAD_STACK_SIZE as usize)
+                    .expect("Invalid main thread stack size");
+            thread::Builder::new(thread::Entry::C(*app))
+                .set_stack(stack)
+                .start();
+            app = app.offset(1);
+        }
+    }
+}
+
+#[inline(never)]
+pub(crate) fn init_heap() {
+    unsafe {
+        if INIT_HEAP_DONE {
+            return;
+        }
+        allocator::init_heap(addr_of_mut!(__heap_start), addr_of_mut!(__heap_end));
+        INIT_HEAP_DONE = true;
+    }
+}

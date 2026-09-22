@@ -1,0 +1,83 @@
+# Copyright (c) 2025 vivo Mobile Communication Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/templates/build_template.gni")
+import("//build/toolchain/blueos.gni")
+
+group("check_infra") {
+  testonly = true
+  deps = [ ":run_infra_unittest" ]
+}
+
+group("check_infra_by_miri") {
+  testonly = true
+  deps = [ ":infra_miri_test" ]
+}
+
+group("check_infra_by_clippy") {
+  testonly = true
+  deps = [
+    ":blueos_infra_clippy",
+    ":infra_unittest_clippy",
+  ]
+}
+
+shared_deps = [
+  "//external/vendor/cfg-if-1.0.4:cfg_if",
+  "//external/vendor/memchr-2.7.6:memchr",
+  "//external/vendor/spin-0.9.8:spin",
+]
+
+build_rust("blueos_infra") {
+  crate_type = "rlib"
+  sources = [ "src/lib.rs" ]
+  edition = "2021"
+  deps = shared_deps
+}
+
+run_clippy("blueos_infra_clippy") {
+  deps = [ ":blueos_infra" ]
+}
+
+miri_test("infra_miri_test") {
+  crate = "src/lib.rs"
+
+  # test_name = "test_basic"   # optional
+  extra_miri_flags = [
+    # "-Zmiri-tree-borrows", # use tree borrow model
+    # "-Zmiri-preemption-rate=0.01", # controls how often Miri forces a thread context switch during scheduling.
+    # more miri flags...
+  ]
+}
+
+build_rust("infra_unittest") {
+  testonly = true
+  crate_name = "infra_unittest"
+  crate_type = "bin"
+  sources = [ "src/lib.rs" ]
+  edition = "2021"
+
+  deps = shared_deps
+  rustflags = [ "--test" ]
+}
+
+run_clippy("infra_unittest_clippy") {
+  testonly = true
+  deps = [ ":infra_unittest" ]
+}
+
+run_host("run_infra_unittest") {
+  testonly = true
+  runner = ":infra_unittest"
+}

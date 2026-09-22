@@ -1,0 +1,116 @@
+// Copyright (c) 2026 vivo Mobile Communication Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::config;
+use crate::{
+    arch,
+    arch::{
+        irq,
+        irq::{IrqTrigger, Priority},
+        mmu,
+        registers::cntfrq_el0::CNTFRQ_EL0,
+    },
+    error::Error,
+    irq::IrqTrace,
+    scheduler,
+    support::SmpStagedInit,
+    time,
+};
+use alloc::boxed::Box;
+use blueos_driver::uart::arm_pl011::ArmPl011Isr;
+use blueos_hal::{isr::IsrDesc, HasInterruptReg};
+use core::sync::atomic::Ordering;
+use tock_registers::interfaces::Readable;
+static STAGING: SmpStagedInit = SmpStagedInit::new();
+
+const NUM_CORES: usize = blueos_kconfig::CONFIG_NUM_CORES as usize;
+pub(crate) fn init() {
+    STAGING.run(0, true, crate::boot::init_runtime);
+    STAGING.run(1, true, crate::boot::init_heap);
+    STAGING.run(2, false, arch::vector::init);
+    STAGING.run(3, true, || unsafe {
+        arch::irq::init(config::GICD as u64, config::GICR as u64, NUM_CORES, false)
+    });
+    STAGING.run(4, false, arch::irq::cpu_init);
+    STAGING.run(5, false, || {
+        irq::enable_irq_with_priority(
+            config::PL011_UART0_IRQNUM,
+            arch::current_cpu_id(),
+            irq::Priority::Normal,
+        );
+    });
+    STAGING.run(6, false, || {
+        irq::enable_irq_with_priority(
+            config::GENERIC_TIMER_IRQNUM,
+            arch::current_cpu_id(),
+            irq::Priority::Normal,
+        );
+    });
+    STAGING.run(7, true, || arch::secondary_cpu_setup(config::PSCI_BASE));
+    if arch::current_cpu_id() != 0 {
+        scheduler::wait_and_then_start_schedule();
+        unreachable!("Secondary cores should have jumped to the scheduler");
+    }
+
+    irq::set_trigger(
+        config::PL011_UART0_IRQNUM,
+        arch::current_cpu_id(),
+        irq::IrqTrigger::Level,
+    );
+    let _ = irq::register_handler(
+        config::PL011_UART0_IRQNUM,
+        Box::new(
+            ArmPl011Isr::<{ config::PL011_UART0_BASE as usize }, _>::new(
+                &crate::drivers::serial::TTY_SERIAL,
+                Some(crate::drivers::serial::Serial::xmitchars),
+                Some(crate::drivers::serial::Serial::recvchars),
+            ),
+        ),
+    );
+    let _ = irq::register_handler(config::GENERIC_TIMER_IRQNUM, Box::new(TimerIrq {}));
+}
+
+crate::define_peripheral! {
+    (console_uart, blueos_driver::uart::arm_pl011::ArmPl011<'static>,
+     blueos_driver::uart::arm_pl011::ArmPl011::<'static>::new(
+        config::PL011_UART0_BASE as _,
+        config::APBP_CLOCK,
+        None,
+     )),
+}
+
+pub const DRAM_BASE: usize = mmu::kernel_phys_to_virt(0x4000_0000);
+
+crate::define_pin_states!(None);
+
+#[cfg(fatfs)]
+pub const BLOCK_STORAGE_DEVICE_NAME: &str = "virt-storage";
+#[cfg(fatfs)]
+pub const BLOCK_STORAGE_MOUNT_POINT: &str = "fat";
+
+pub const BLOCK_STORAGE_POLICY: crate::boards::BlockStoragePolicy =
+    crate::boards::BlockStoragePolicy::Required;
+
+// virtio block device is registered in virtio::init_virtio(); no extra init.
+#[cfg(enable_block)]
+pub(crate) fn init_block_devices() -> crate::drivers::Result<()> {
+    Ok(())
+}
+
+pub struct TimerIrq;
+impl IsrDesc for TimerIrq {
+    fn service_isr(&self) {
+        crate::time::handle_clock_interrupt();
+    }
+}

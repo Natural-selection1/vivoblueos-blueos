@@ -1,0 +1,57 @@
+# Copyright (c) 2025 vivo Mobile Communication Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/templates/build_template.gni")
+
+group("check_rsrt") {
+  testonly = true
+  deps = [
+    ":rsrt",
+    ":rsrt_std",
+  ]
+}
+
+build_rust("rsrt") {
+  crate_type = "rlib"
+  crate_name = "rsrt"
+  sources = [ "src/lib.rs" ]
+  deps = [ "//kernel/kernel:blueos" ]
+}
+
+run_clippy("rsrt_clippy") {
+  deps = [ ":rsrt" ]
+}
+
+build_rust("rsrt_std") {
+  crate_type = "rlib"
+  crate_name = "rsrt"
+  sources = [ "src/lib.rs" ]
+  deps = [
+    "//external/vendor/semihosting-0.1.20:semihosting",
+    "//kernel/kernel:blueos",
+  ]
+  features = [ "std" ]
+  public_deps = board_deps
+}
+
+run_clippy("rsrt_std_clippy") {
+  deps = [ ":rsrt_std" ]
+}
+
+group("check_rsrt_by_clippy") {
+  deps = [
+    ":rsrt_clippy",
+    ":rsrt_std_clippy",
+  ]
+}

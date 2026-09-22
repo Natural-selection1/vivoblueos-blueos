@@ -1,0 +1,117 @@
+// Copyright (c) 2026 vivo Mobile Communication Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// This code is based on
+// https://github.com/eclipse-threadx/threadx/blob/master/ports/risc-v64/gnu/example_build/qemu_virt/hwtimer.c
+// https://github.com/eclipse-threadx/threadx/blob/master/ports/risc-v64/gnu/example_build/qemu_virt/trap.c
+// https://github.com/eclipse-threadx/threadx/blob/master/ports/risc-v64/gnu/example_build/qemu_virt/uart.c
+// Copyright (c) 2024 - present Microsoft Corporation
+// SPDX-License-Identifier: MIT
+
+mod config;
+use crate::{
+    arch,
+    arch::riscv::{local_irq_enabled, trap_entry, Context},
+    drivers::{ic::plic::Plic, msip::Msip},
+    scheduler,
+    support::SmpStagedInit,
+    time,
+};
+use blueos_driver::uart::ns16x50::Ns16x50Isr;
+use blueos_hal::{clock::Clock, isr::IsrDesc};
+pub use config::{PHYS_DRAM_BASE, PHYS_DRAM_SIZE};
+use core::sync::atomic::Ordering;
+pub(crate) static PLIC: Plic = Plic::new(config::PLIC_BASE);
+pub use crate::devices::clock::riscv_clock::QemuRiscvClock as ClockImpl;
+
+#[inline]
+fn init_vector_table() {
+    unsafe {
+        core::arch::asm!(
+            "la {x}, {entry}",
+            "csrw mtvec, {x}",
+            x = out(reg) _,
+            entry = sym trap_entry,
+            options(nostack),
+        );
+    }
+}
+
+/// FIXME: The serial port of qemu_riscv32 is not working until
+/// we finish the handle_irq function.
+pub(crate) fn handle_plic_irq(ctx: &Context, mcause: usize, mtval: usize) {
+    let cpu_id = arch::current_cpu_id();
+    let irq = PLIC.claim(cpu_id);
+    if irq == 10 {
+        UART0_ISR.service_isr();
+    }
+    PLIC.complete(cpu_id, irq)
+}
+
+static STAGING: SmpStagedInit = SmpStagedInit::new();
+
+pub(crate) fn init() {
+    assert!(!local_irq_enabled());
+    STAGING.run(0, true, crate::boot::init_runtime);
+    STAGING.run(1, true, crate::boot::init_heap);
+    STAGING.run(2, false, init_vector_table);
+    STAGING.run(3, false, ClockImpl::stop);
+    // From now on, all work will be done by core 0.
+    if arch::current_cpu_id() != 0 {
+        scheduler::wait_and_then_start_schedule();
+        unreachable!("Secondary cores should have jumped to the scheduler");
+    }
+    // Enable UART0 in PLIC.
+    PLIC.enable(
+        arch::current_cpu_id(),
+        u32::try_from(usize::from(config::NS16550_UART0_IRQNUM))
+            .expect("usize(64 bits) converts to u32 failed"),
+    );
+    // Set UART0 priority in PLIC.
+    PLIC.set_priority(
+        u32::try_from(usize::from(config::NS16550_UART0_IRQNUM))
+            .expect("usize(64 bits) converts to u32 failed"),
+        1,
+    );
+}
+
+crate::define_peripheral! {
+    (console_uart, blueos_driver::uart::ns16x50::Ns16x50,
+     blueos_driver::uart::ns16x50::Ns16x50::new(
+        config::NS16550_UART0_BASE as _,
+    )),
+}
+
+crate::define_pin_states!(None);
+
+type MyMsip = Msip<0x0200_0000>;
+
+#[inline(always)]
+pub(crate) fn send_ipi(hart: usize) {
+    MyMsip::send_ipi(hart)
+}
+
+#[inline(always)]
+pub(crate) fn clear_ipi(hart: usize) {
+    MyMsip::clear_ipi(hart)
+}
+
+static UART0_ISR: Ns16x50Isr<
+    { config::NS16550_UART0_BASE as usize },
+    crate::drivers::serial::Serial,
+> = Ns16x50Isr::new(
+    &crate::drivers::serial::TTY_SERIAL,
+    Some(crate::drivers::serial::Serial::xmitchars),
+    Some(crate::drivers::serial::Serial::recvchars),
+);

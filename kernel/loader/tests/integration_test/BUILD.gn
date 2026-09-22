@@ -1,0 +1,94 @@
+# Copyright (c) 2025 vivo Mobile Communication Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/boards/${board}.gni")
+import("//build/templates/build_template.gni")
+import("//build/toolchain/blueos.gni")
+
+build_rust("loader_integration_test") {
+  testonly = true
+  crate_type = "bin"
+  edition = "2021"
+  sources = [ "src/test.rs" ]
+  deps = [
+    "//external/vendor/semihosting-0.1.20:semihosting",
+    "//kernel/kernel:blueos",
+    "//kernel/loader:blueos_loader",
+    "//kernel/loader/tests/inputs",
+    "//kernel/rsrt",
+    "//libc",
+    "//librs",
+  ]
+  linker_script = default_linker_script
+  if (coverage || profile) {
+    deps += [
+      "//kernel/kernel:atomic",
+      "//kernel/loader:common_cov",
+    ]
+  }
+  proc_macro_deps = [ "//kernel/test_harness:blueos_test_macro" ]
+  rustflags = [ "--test" ]
+
+  if (defined(loader_test_relocation)) {
+    rustenv = [
+      "LOADER_TEST_RELOCATION_ORIGIN=${loader_test_relocation.origin}",
+      "LOADER_TEST_RELOCATION_LENGTH=${loader_test_relocation.length}",
+      "LOADER_TEST_RELOCATION_PERMISSIONS=${loader_test_relocation.permissions}",
+    ]
+    cfgs = [ "loader_test_exec" ]
+  }
+}
+
+run_clippy("loader_integration_test_clippy") {
+  testonly = true
+  deps = [ ":loader_integration_test" ]
+}
+
+if (defined(qemu_use_esp32_loader) && qemu_use_esp32_loader) {
+  gen_esp32_qemu_runner("loader_integration_test_runner") {
+    testonly = true
+    elf = ":loader_integration_test"
+    chip = "${chip}"
+    bootloader = qemu_esp32_bootloader_bin
+    partition_table = qemu_esp32_partition_table_bin
+    qemu = qemu_exe
+    machine = qemu_machine
+    qemu_args = qemu_extra_args
+    net_args = qemu_net_args
+    block_args = qemu_block_args
+    semihosting = true
+  }
+} else {
+  gen_qemu_runner("loader_integration_test_runner") {
+    testonly = true
+    img = ":loader_integration_test"
+    qemu = qemu_exe
+    machine = qemu_machine
+    semihosting = true
+    qemu_args = qemu_extra_args
+    block_img = "loader_integration_test_block.img"
+    block_args = qemu_block_args
+  }
+}
+
+run_qemu_check("run_loader_integration_test") {
+  testonly = true
+  runner = ":loader_integration_test_runner"
+  if (coverage) {
+    img = ":loader_integration_test"
+    checker = "//kernel/loader/tests/cov/lib.rs"
+  } else {
+    checker = "src/test.rs"
+  }
+}

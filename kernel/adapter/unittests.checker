@@ -1,0 +1,3 @@
+// NEWLINE-TIMEOUT: 8
+// ASSERT-SUCC: adapter unittest ended
+// ASSERT-FAIL: Oops:

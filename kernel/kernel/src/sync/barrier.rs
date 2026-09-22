@@ -1,0 +1,112 @@
+// Copyright (c) 2025 vivo Mobile Communication Co., Ltd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Similar to std::sync::Barrier.
+
+use crate::{
+    sync::{atomic_wait, atomic_wake},
+    time::Tick,
+};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+// Used when N is small and contention is low.
+#[derive(Debug, Default)]
+pub struct ConstBarrier<const N: usize> {
+    state: AtomicUsize,
+}
+
+impl<const N: usize> ConstBarrier<N> {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn wait(&self) {
+        let mut n = self.state.fetch_add(1, Ordering::Release) + 1;
+        if n == N {
+            let _ = atomic_wake(&self.state, n - 1);
+            return;
+        }
+        loop {
+            let _ = atomic_wait(&self.state, n, Tick::MAX);
+            n = self.state.load(Ordering::Acquire);
+            if n == N {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{static_arc, types::Arc};
+    use alloc::vec::Vec;
+    use blueos_test_macro::test;
+    const UNITTEST_THREAD_NUM: usize = blueos_kconfig::CONFIG_UNITTEST_THREAD_NUM as usize;
+
+    static_arc! {
+        BARRIER(ConstBarrier<2>, ConstBarrier::<{ 2 }>::new()),
+    }
+
+    static_arc! {
+        BARRIER_MANY(ConstBarrier<{UNITTEST_THREAD_NUM}>, ConstBarrier::<{UNITTEST_THREAD_NUM}>::new()),
+    }
+
+    #[test]
+    fn test_barrier_basic() {
+        crate::thread::spawn(|| {
+            BARRIER.wait();
+        });
+        BARRIER.wait();
+    }
+
+    // Should not hang.
+    #[test]
+    fn stress_barrier() {
+        for i in 0..UNITTEST_THREAD_NUM - 1 {
+            crate::thread::spawn(|| {
+                BARRIER_MANY.wait();
+            });
+        }
+        BARRIER_MANY.wait();
+    }
+
+    #[test]
+    fn join_thread() {
+        let n = UNITTEST_THREAD_NUM;
+        let mut vt = Vec::new();
+        let counter = Arc::new(AtomicUsize::new(n));
+        for i in 0..n {
+            let b = Arc::new(ConstBarrier::<{ 2 }>::new());
+            vt.push(b.clone());
+            let counter = counter.clone();
+            let mi = crate::allocator::memory_info();
+            semihosting::println!("[JT] pre-spawn i={} used={}", i, mi.used);
+            crate::thread::spawn(move || {
+                counter.fetch_sub(1, Ordering::Relaxed);
+                b.wait();
+            });
+            semihosting::println!("[JT] spawned i={}", i);
+        }
+        semihosting::println!("[JT] spawn-done vt.len()={}", vt.len());
+        assert_eq!(vt.len(), n);
+        for b in vt {
+            b.wait();
+        }
+        semihosting::println!("[JT] counter={}", counter.load(Ordering::SeqCst));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+}
