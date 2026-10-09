@@ -190,7 +190,7 @@ SECTIONS {
     KEEP (*(EXCLUDE_FILE (*crtend.* *crtbegin.*) .init_array))
     PROVIDE(__init_array_end = .);
     . = ALIGN(4);
-  } > RODATA
+  } > RODATA  
 
   .rodata.wifi : ALIGN(4)
   {
